@@ -1,0 +1,14 @@
+node_modules/
+.next/
+out/
+.data/
+*.tsbuildinfo
+next-env.d.ts
+.env
+.env.local
+.env.*.local
+npm-debug.log*
+test-photos/*.jpg
+test-photos/*.jpeg
+test-photos/*.png
+!test-photos/README.md
