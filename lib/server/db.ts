@@ -10,6 +10,9 @@ export interface ReadingQuery {
   limit?: number;
 }
 
+/** Thrown when an alert with the same dedupe key is already stored: someone else got there first. */
+export class DuplicateAlertError extends Error {}
+
 /** Storage used by the whole app. Two implementations: Supabase, or a local JSON file / memory. */
 export interface Db {
   readonly kind: "supabase" | "file" | "memory";
@@ -17,14 +20,18 @@ export interface Db {
   getStation(id: string): Promise<Station | null>;
   upsertStation(s: Station): Promise<Station>;
 
+  /** Returns the stored row; a repeat of the same clientId returns the original reading. */
   insertReading(r: Reading): Promise<Reading>;
   updateReading(id: string, patch: Partial<Reading>): Promise<Reading | null>;
   getReading(id: string): Promise<Reading | null>;
   findReadingByClientId(stationId: string, clientId: string): Promise<Reading | null>;
+  findReadingByPhotoHash(stationId: string, hash: string, sinceIso: string): Promise<Reading | null>;
   /** Newest first. */
   listReadings(stationId: string, q?: ReadingQuery): Promise<Reading[]>;
 
+  /** Throws DuplicateAlertError when the dedupe key is taken. */
   insertAlert(a: Alert): Promise<Alert>;
+  updateAlertRecipients(id: string, recipients: number): Promise<void>;
   /** Newest first. */
   listAlerts(stationId: string, sinceIso?: string): Promise<Alert[]>;
 
@@ -39,12 +46,22 @@ export interface Db {
   insertReminder(r: Reminder): Promise<void>;
   listReminders(q: { stationId?: string; dueBeforeIso?: string; unsentOnly?: boolean }): Promise<Reminder[]>;
   markReminderSent(id: string, sentAt: string): Promise<void>;
+  purgeReminders(beforeIso: string): Promise<number>;
 
   insertOutbox(m: OutboxMessage): Promise<void>;
   listOutbox(limit?: number): Promise<OutboxMessage[]>;
+  /** Undelivered messages that still have retries left, oldest first. */
+  listOutboxPending(limit?: number): Promise<OutboxMessage[]>;
+  updateOutbox(id: string, patch: { delivered?: boolean; error?: string | null; retries?: number }): Promise<void>;
 
   savePhoto(key: string, bytes: Buffer, contentType: string): Promise<string>;
   loadPhoto(photoPath: string): Promise<{ bytes: Buffer; contentType: string } | null>;
+  /** Delete photos for readings older than `beforeIso` and clear their photoPath. Returns the count. */
+  purgePhotos(beforeIso: string): Promise<number>;
+
+  /** Small key/value store for things like the last successful background tick. */
+  setMeta(key: string, value: string): Promise<void>;
+  getMeta(key: string): Promise<string | null>;
 
   /** Delete all readings/alerts/reminders for a station (used by the demo reset). */
   resetStation(stationId: string): Promise<void>;
@@ -65,6 +82,7 @@ interface FileState {
   advisories: Advisory[];
   reminders: Reminder[];
   outbox: OutboxMessage[];
+  meta: Record<string, string>;
 }
 
 const emptyState = (): FileState => ({
@@ -78,6 +96,7 @@ const emptyState = (): FileState => ({
   advisories: [],
   reminders: [],
   outbox: [],
+  meta: {},
 });
 
 const byNewest = <T>(get: (x: T) => string) => (a: T, b: T) => Date.parse(get(b)) - Date.parse(get(a));
@@ -164,6 +183,10 @@ export class FileDb implements Db {
 
   async insertReading(r: Reading) {
     return this.mutate((s) => {
+      if (r.clientId) {
+        const existing = s.readings.find((x) => x.stationId === r.stationId && x.clientId === r.clientId);
+        if (existing) return existing;
+      }
       s.readings.push(r);
       return r;
     });
@@ -182,6 +205,14 @@ export class FileDb implements Db {
   async findReadingByClientId(stationId: string, clientId: string) {
     return (await this.load()).readings.find((r) => r.stationId === stationId && r.clientId === clientId) ?? null;
   }
+  async findReadingByPhotoHash(stationId: string, hash: string, sinceIso: string) {
+    const since = Date.parse(sinceIso);
+    return (
+      (await this.load()).readings
+        .filter((r) => r.stationId === stationId && r.photoHash === hash && Date.parse(r.takenAt) >= since)
+        .sort(byNewest((r) => r.takenAt))[0] ?? null
+    );
+  }
   async listReadings(stationId: string, q: ReadingQuery = {}) {
     const since = q.sinceIso ? Date.parse(q.sinceIso) : -Infinity;
     const rows = (await this.load()).readings
@@ -192,8 +223,17 @@ export class FileDb implements Db {
 
   async insertAlert(a: Alert) {
     return this.mutate((s) => {
+      if (s.alerts.some((x) => x.dedupeKey === a.dedupeKey)) {
+        throw new DuplicateAlertError(`alert ${a.dedupeKey} already sent`);
+      }
       s.alerts.push(a);
       return a;
+    });
+  }
+  async updateAlertRecipients(id: string, recipients: number) {
+    await this.mutate((s) => {
+      const a = s.alerts.find((x) => x.id === id);
+      if (a) a.recipients = recipients;
     });
   }
   async listAlerts(stationId: string, sinceIso?: string) {
@@ -249,6 +289,14 @@ export class FileDb implements Db {
       if (r) r.sentAt = sentAt;
     });
   }
+  async purgeReminders(beforeIso: string) {
+    const before = Date.parse(beforeIso);
+    return this.mutate((s) => {
+      const n = s.reminders.length;
+      s.reminders = s.reminders.filter((r) => !r.sentAt || Date.parse(r.createdAt) >= before);
+      return n - s.reminders.length;
+    });
+  }
 
   async insertOutbox(m: OutboxMessage) {
     await this.mutate((s) => {
@@ -258,6 +306,18 @@ export class FileDb implements Db {
   }
   async listOutbox(limit = 50) {
     return [...(await this.load()).outbox].sort(byNewest((m) => m.createdAt)).slice(0, limit);
+  }
+  async listOutboxPending(limit = 50) {
+    return (await this.load()).outbox
+      .filter((m) => !m.delivered && (m.retries ?? 0) > 0)
+      .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt))
+      .slice(0, limit);
+  }
+  async updateOutbox(id: string, patch: { delivered?: boolean; error?: string | null; retries?: number }) {
+    await this.mutate((s) => {
+      const m = s.outbox.find((x) => x.id === id);
+      if (m) Object.assign(m, patch);
+    });
   }
 
   private memPhotos = new Map<string, { bytes: Buffer; contentType: string }>();
@@ -282,6 +342,36 @@ export class FileDb implements Db {
     } catch {
       return null;
     }
+  }
+  async purgePhotos(beforeIso: string) {
+    const before = Date.parse(beforeIso);
+    const stale = (await this.load()).readings.filter((r) => r.photoPath && Date.parse(r.takenAt) < before);
+    for (const r of stale) {
+      if (!r.photoPath) continue;
+      if (this.dir) {
+        const root = path.resolve(this.dir, "photos");
+        const file = path.resolve(root, r.photoPath);
+        if (file.startsWith(root + path.sep)) await fs.rm(file, { force: true });
+      } else {
+        this.memPhotos.delete(r.photoPath);
+      }
+    }
+    if (stale.length) {
+      const ids = new Set(stale.map((r) => r.id));
+      await this.mutate((s) => {
+        for (const r of s.readings) if (ids.has(r.id)) r.photoPath = null;
+      });
+    }
+    return stale.length;
+  }
+
+  async setMeta(key: string, value: string) {
+    await this.mutate((s) => {
+      s.meta = { ...s.meta, [key]: value };
+    });
+  }
+  async getMeta(key: string) {
+    return (await this.load()).meta?.[key] ?? null;
   }
 
   async resetStation(stationId: string) {
@@ -310,6 +400,9 @@ const stationToRow = (s: Station): Row => ({
   threshold_alarm: s.thresholds.alarm,
   threshold_critical: s.thresholds.critical,
   tolerance: s.tolerance,
+  max_rate_per_hour: s.maxRatePerHour,
+  evacuation_center: s.evacuationCenter,
+  hotline: s.hotline,
   team_chat_ids: s.teamChatIds,
 });
 const rowToStation = (r: Row): Station => ({
@@ -325,6 +418,9 @@ const rowToStation = (r: Row): Station => ({
     critical: Number(r.threshold_critical),
   },
   tolerance: Number(r.tolerance),
+  maxRatePerHour: r.max_rate_per_hour == null ? 2 : Number(r.max_rate_per_hour),
+  evacuationCenter: (r.evacuation_center as string) ?? "",
+  hotline: (r.hotline as string) ?? "",
   teamChatIds: (r.team_chat_ids as string[]) ?? [],
   createdAt: r.created_at as string,
 });
@@ -344,11 +440,14 @@ const readingToRow = (r: Partial<Reading>): Row => {
     ai_notes: "aiNotes",
     observer_level: "observerLevel",
     observer_name: "observerName",
+    observer_key: "observerKey",
     level: "level",
     status: "status",
     status_reason: "statusReason",
     photo_path: "photoPath",
+    photo_hash: "photoHash",
     confirmed_by: "confirmedBy",
+    confirmed_by_key: "confirmedByKey",
   };
   const row: Row = {};
   for (const [col, key] of Object.entries(map)) if (key in r) row[col] = r[key];
@@ -366,20 +465,25 @@ const rowToReading = (r: Row): Reading => ({
   aiNotes: (r.ai_notes as string) ?? null,
   observerLevel: num(r.observer_level),
   observerName: (r.observer_name as string) ?? null,
+  observerKey: (r.observer_key as string) ?? null,
   level: num(r.level),
   status: r.status as Reading["status"],
   statusReason: (r.status_reason as string) ?? "",
   photoPath: (r.photo_path as string) ?? null,
+  photoHash: (r.photo_hash as string) ?? null,
   confirmedBy: (r.confirmed_by as string) ?? null,
+  confirmedByKey: (r.confirmed_by_key as string) ?? null,
 });
 const rowToAlert = (r: Row): Alert => ({
   id: r.id as string,
   stationId: r.station_id as string,
   readingId: (r.reading_id as string) ?? null,
   level: r.level as Alert["level"],
+  kind: (r.kind as Alert["kind"]) ?? "stage",
   message: r.message as string,
   origin: r.origin as Alert["origin"],
   recipients: Number(r.recipients),
+  dedupeKey: (r.dedupe_key as string) ?? (r.id as string),
   createdAt: r.created_at as string,
 });
 const rowToSub = (r: Row): Subscriber => ({
@@ -396,11 +500,25 @@ const rowToReminder = (r: Row): Reminder => ({
   sentAt: (r.sent_at as string) ?? null,
   createdAt: r.created_at as string,
 });
+const rowToOutbox = (r: Row): OutboxMessage => ({
+  id: r.id as string,
+  chatId: r.chat_id as string,
+  text: r.text as string,
+  delivered: Boolean(r.delivered),
+  error: (r.error as string) ?? null,
+  retries: r.retries == null ? 0 : Number(r.retries),
+  createdAt: r.created_at as string,
+});
+
+const UNIQUE_VIOLATION = "23505";
 
 function check<T>(res: { data: T; error: { message: string } | null }): T {
   if (res.error) throw new Error(`Supabase: ${res.error.message}`);
   return res.data;
 }
+
+const isUnique = (error: unknown): boolean =>
+  !!error && typeof error === "object" && (error as { code?: string }).code === UNIQUE_VIOLATION;
 
 export class SupabaseDb implements Db {
   readonly kind = "supabase" as const;
@@ -421,7 +539,16 @@ export class SupabaseDb implements Db {
   }
 
   async insertReading(r: Reading) {
-    return rowToReading(check(await this.sb.from("readings").insert(readingToRow(r)).select().single()) as Row);
+    const res = await this.sb.from("readings").insert(readingToRow(r)).select().single();
+    if (res.error) {
+      // A retried offline send races with the first one: hand back the stored row.
+      if (isUnique(res.error) && r.clientId) {
+        const existing = await this.findReadingByClientId(r.stationId, r.clientId);
+        if (existing) return existing;
+      }
+      throw new Error(`Supabase: ${res.error.message}`);
+    }
+    return rowToReading(res.data as Row);
   }
   async updateReading(id: string, patch: Partial<Reading>) {
     const { id: _ignored, ...rest } = patch;
@@ -440,6 +567,19 @@ export class SupabaseDb implements Db {
     ) as Row | null;
     return row ? rowToReading(row) : null;
   }
+  async findReadingByPhotoHash(stationId: string, hash: string, sinceIso: string) {
+    const rows = check(
+      await this.sb
+        .from("readings")
+        .select("*")
+        .eq("station_id", stationId)
+        .eq("photo_hash", hash)
+        .gte("taken_at", sinceIso)
+        .order("taken_at", { ascending: false })
+        .limit(1),
+    ) as Row[];
+    return rows[0] ? rowToReading(rows[0]) : null;
+  }
   async listReadings(stationId: string, q: ReadingQuery = {}) {
     let query = this.sb.from("readings").select("*").eq("station_id", stationId).order("taken_at", { ascending: false });
     if (q.sinceIso) query = query.gte("taken_at", q.sinceIso);
@@ -449,23 +589,30 @@ export class SupabaseDb implements Db {
   }
 
   async insertAlert(a: Alert) {
-    const row = check(
-      await this.sb
-        .from("alerts")
-        .insert({
-          id: a.id,
-          station_id: a.stationId,
-          reading_id: a.readingId,
-          level: a.level,
-          message: a.message,
-          origin: a.origin,
-          recipients: a.recipients,
-          created_at: a.createdAt,
-        })
-        .select()
-        .single(),
-    ) as Row;
-    return rowToAlert(row);
+    const res = await this.sb
+      .from("alerts")
+      .insert({
+        id: a.id,
+        station_id: a.stationId,
+        reading_id: a.readingId,
+        level: a.level,
+        kind: a.kind,
+        message: a.message,
+        origin: a.origin,
+        recipients: a.recipients,
+        dedupe_key: a.dedupeKey,
+        created_at: a.createdAt,
+      })
+      .select()
+      .single();
+    if (res.error) {
+      if (isUnique(res.error)) throw new DuplicateAlertError(`alert ${a.dedupeKey} already sent`);
+      throw new Error(`Supabase: ${res.error.message}`);
+    }
+    return rowToAlert(res.data as Row);
+  }
+  async updateAlertRecipients(id: string, recipients: number) {
+    check(await this.sb.from("alerts").update({ recipients }).eq("id", id));
   }
   async listAlerts(stationId: string, sinceIso?: string) {
     let query = this.sb.from("alerts").select("*").eq("station_id", stationId).order("created_at", { ascending: false });
@@ -533,10 +680,16 @@ export class SupabaseDb implements Db {
     if (q.stationId) query = query.eq("station_id", q.stationId);
     if (q.dueBeforeIso) query = query.lte("due_at", q.dueBeforeIso);
     if (q.unsentOnly) query = query.is("sent_at", null);
-    return (check(await query) as Row[]).map(rowToReminder);
+    return (check(await query.order("due_at", { ascending: false }).limit(500)) as Row[]).map(rowToReminder);
   }
   async markReminderSent(id: string, sentAt: string) {
     check(await this.sb.from("reminders").update({ sent_at: sentAt }).eq("id", id));
+  }
+  async purgeReminders(beforeIso: string) {
+    const rows = check(
+      await this.sb.from("reminders").delete().lt("created_at", beforeIso).not("sent_at", "is", null).select(),
+    ) as Row[];
+    return rows.length;
   }
 
   async insertOutbox(m: OutboxMessage) {
@@ -547,6 +700,7 @@ export class SupabaseDb implements Db {
         text: m.text,
         delivered: m.delivered,
         error: m.error,
+        retries: m.retries,
         created_at: m.createdAt,
       }),
     );
@@ -555,14 +709,22 @@ export class SupabaseDb implements Db {
     const rows = check(
       await this.sb.from("outbox").select("*").order("created_at", { ascending: false }).limit(limit),
     ) as Row[];
-    return rows.map((r) => ({
-      id: r.id as string,
-      chatId: r.chat_id as string,
-      text: r.text as string,
-      delivered: Boolean(r.delivered),
-      error: (r.error as string) ?? null,
-      createdAt: r.created_at as string,
-    }));
+    return rows.map(rowToOutbox);
+  }
+  async listOutboxPending(limit = 50) {
+    const rows = check(
+      await this.sb
+        .from("outbox")
+        .select("*")
+        .eq("delivered", false)
+        .gt("retries", 0)
+        .order("created_at", { ascending: true })
+        .limit(limit),
+    ) as Row[];
+    return rows.map(rowToOutbox);
+  }
+  async updateOutbox(id: string, patch: { delivered?: boolean; error?: string | null; retries?: number }) {
+    check(await this.sb.from("outbox").update(patch).eq("id", id));
   }
 
   async savePhoto(key: string, bytes: Buffer, contentType: string) {
@@ -573,6 +735,29 @@ export class SupabaseDb implements Db {
     const { data, error } = await this.sb.storage.from(this.bucket).download(photoPath);
     if (error || !data) return null;
     return { bytes: Buffer.from(await data.arrayBuffer()), contentType: data.type || "image/jpeg" };
+  }
+  async purgePhotos(beforeIso: string) {
+    const rows = check(
+      await this.sb.from("readings").select("id,photo_path").lt("taken_at", beforeIso).not("photo_path", "is", null).limit(500),
+    ) as Row[];
+    if (!rows.length) return 0;
+    const paths = rows.map((r) => r.photo_path as string);
+    await this.sb.storage.from(this.bucket).remove(paths);
+    check(
+      await this.sb
+        .from("readings")
+        .update({ photo_path: null })
+        .in("id", rows.map((r) => r.id as string)),
+    );
+    return rows.length;
+  }
+
+  async setMeta(key: string, value: string) {
+    check(await this.sb.from("meta").upsert({ key, value, updated_at: nowIso() }, { onConflict: "key" }));
+  }
+  async getMeta(key: string) {
+    const row = check(await this.sb.from("meta").select("value").eq("key", key).maybeSingle()) as Row | null;
+    return row ? (row.value as string) : null;
   }
 
   async resetStation(stationId: string) {

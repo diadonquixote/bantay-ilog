@@ -20,6 +20,7 @@ interface Outcome {
 interface FrameResponse {
   reading: Reading;
   outcome: Outcome | null;
+  provisional?: Alert[];
   ai: { level: number | null; confidence: number | null; notes: string; mode: string };
   aiMode: string;
 }
@@ -183,9 +184,16 @@ export default function DemoPage() {
                     Alert step ({outcome.mode}): {outcome.summary}
                   </div>
                 )}
+                {s.res?.provisional?.map((a) => (
+                  <div key={a.id} className="notice warn small" style={{ whiteSpace: "pre-wrap" }}>
+                    <LevelBadge stage={a.level} /> provisional warning while the reading is checked
+                    {"\n"}
+                    {a.message}
+                  </div>
+                ))}
                 {outcome?.alerts.map((a) => (
-                  <div key={a.id} className="notice small" style={{ whiteSpace: "pre-wrap" }}>
-                    <LevelBadge stage={a.level} /> sent to {a.recipients} chat(s)
+                  <div key={a.id} className={`notice small stage-${a.level}`} style={{ whiteSpace: "pre-wrap" }}>
+                    <LevelBadge stage={a.level} /> <span className="pill">{a.kind}</span> sent to {a.recipients} chat(s)
                     {outcome.safetyNet.some((x) => x.id === a.id) ? " by the safety net" : ""}
                     {"\n"}
                     {a.message}

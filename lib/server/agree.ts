@@ -3,10 +3,14 @@ import type { ReadingStatus, Station } from "../schemas";
 export interface AgreeInput {
   aiLevel: number | null;
   aiConfidence: number | null;
+  /** Photo problems the model reported (blur, glare, waves...). Any of these blocks an AI-only accept. */
+  aiIssues?: string[];
   observerLevel: number | null;
   /** Last accepted reading at this station, used for the jump check. */
   previous?: { level: number; takenAt: string } | null;
   takenAt: string;
+  /** Set when this exact photo was already sent for this station. */
+  duplicatePhotoOf?: { takenAt: string } | null;
 }
 
 export interface AgreeResult {
@@ -20,8 +24,15 @@ export interface AgreeResult {
 
 /** AI reads below this confidence never stand on their own. */
 export const MIN_SOLO_CONFIDENCE = 0.85;
-/** A real river rarely moves faster than this; bigger jumps need a human look. */
+/** Fallback when a station has no maxRatePerHour: a real river rarely moves faster than this. */
 export const MAX_RATE_M_PER_HOUR = 2;
+/**
+ * Two independent sources agreeing buy some extra benefit of the doubt on a
+ * fast rise — a flash flood should not be held back as "implausible" when two
+ * people read the same number — but not so much that a misread decimal point
+ * sails through.
+ */
+export const AGREED_RATE_MULTIPLIER = 1.5;
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
 
@@ -41,6 +52,15 @@ export function agree(input: AgreeInput, station: Station): AgreeResult {
     return { status: "rejected", level: null, reason: "No readable level from photo or observer.", urgent: false };
   }
 
+  if (input.duplicatePhotoOf) {
+    return {
+      status: "needs_confirmation",
+      level: null,
+      reason: "This exact photo was already sent for this station; a fresh photo of the gauge is needed.",
+      urgent,
+    };
+  }
+
   const outOfRange = candidates.find((v) => v < station.gaugeMin - 0.5 || v > station.gaugeMax + 0.5);
   if (outOfRange != null) {
     return {
@@ -53,6 +73,7 @@ export function agree(input: AgreeInput, station: Station): AgreeResult {
 
   let level: number;
   let reason: string;
+  let agreedBySources = false;
 
   if (aiLevel != null && observerLevel != null) {
     const diff = Math.abs(aiLevel - observerLevel);
@@ -67,8 +88,18 @@ export function agree(input: AgreeInput, station: Station): AgreeResult {
     // Observer is on site and sees the whole gauge; AI agrees within tolerance.
     level = observerLevel;
     reason = `AI and observer agree within ${diff.toFixed(2)} m.`;
+    agreedBySources = true;
   } else if (aiLevel != null) {
     const conf = aiConfidence ?? 0;
+    const issues = input.aiIssues ?? [];
+    if (issues.length) {
+      return {
+        status: "needs_confirmation",
+        level: null,
+        reason: `AI-only reading from a photo with problems (${issues.join(", ")}); needs a human check.`,
+        urgent,
+      };
+    }
     if (conf < MIN_SOLO_CONFIDENCE) {
       return {
         status: "needs_confirmation",
@@ -92,11 +123,13 @@ export function agree(input: AgreeInput, station: Station): AgreeResult {
   if (prev) {
     const hours = Math.max((Date.parse(input.takenAt) - Date.parse(prev.takenAt)) / 3_600_000, 0.25);
     const rate = Math.abs(level - prev.level) / hours;
-    if (rate > MAX_RATE_M_PER_HOUR) {
+    const base = station.maxRatePerHour || MAX_RATE_M_PER_HOUR;
+    const cap = agreedBySources ? base * AGREED_RATE_MULTIPLIER : base;
+    if (rate > cap) {
       return {
         status: "needs_confirmation",
         level: null,
-        reason: `Change of ${(level - prev.level).toFixed(2)} m since last reading is implausibly fast (${rate.toFixed(1)} m/h).`,
+        reason: `Change of ${(level - prev.level).toFixed(2)} m since last reading is implausibly fast (${rate.toFixed(1)} m/h, limit ${cap} m/h).`,
         urgent,
       };
     }

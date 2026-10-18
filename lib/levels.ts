@@ -88,6 +88,9 @@ export const READING_CADENCE_MIN: Record<LevelKey, number | null> = {
   critical: 15,
 };
 
+/** How far below a threshold the river must fall before an all-clear goes out. */
+export const ALL_CLEAR_MARGIN_M = 0.1;
+
 export function formatLevel(m: number | null | undefined): string {
   return m == null ? "—" : `${m.toFixed(2)} m`;
 }
@@ -101,6 +104,9 @@ export const DEFAULT_STATION: Station = {
   gaugeMax: 22,
   thresholds: { alert: 15, alarm: 16, critical: 17 },
   tolerance: 0.1,
+  maxRatePerHour: 2,
+  evacuationCenter: "",
+  hotline: "",
   teamChatIds: [],
 };
 
@@ -113,6 +119,9 @@ export const DEMO_STATION: Station = {
   gaugeMax: 6,
   thresholds: { alert: 3, alarm: 4, critical: 5 },
   tolerance: 0.1,
+  maxRatePerHour: 2,
+  evacuationCenter: "Demo Elementary School",
+  hotline: "0999-000-0000",
   // Stand-in chat: messages to "demo-*" ids go to the outbox only, never to Telegram.
   teamChatIds: ["demo-team"],
 };

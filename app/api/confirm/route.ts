@@ -1,8 +1,9 @@
 import { ConfirmRequest } from "@/lib/schemas";
-import { adminRequired, badRequest, isAdmin } from "@/lib/server/auth";
+import { adminRequired, badRequest, isAdmin, tooManyRequests } from "@/lib/server/auth";
 import { getDb } from "@/lib/server/db";
 import { getNotifier } from "@/lib/server/notify";
 import { ConfirmError, confirmReading } from "@/lib/server/pipeline";
+import { clientKey, rateLimit } from "@/lib/server/rateLimit";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 120;
@@ -10,6 +11,9 @@ export const maxDuration = 120;
 /** Accept (with a level) or reject a reading that needs confirmation. */
 export async function POST(req: Request) {
   if (!isAdmin(req)) return adminRequired();
+  const wait = rateLimit(`confirm:${clientKey(req)}`, { limit: 20, windowSec: 60 });
+  if (wait != null) return tooManyRequests(wait);
+
   const parsed = ConfirmRequest.safeParse(await req.json().catch(() => null));
   if (!parsed.success) return badRequest(parsed.error);
 

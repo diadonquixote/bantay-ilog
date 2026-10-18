@@ -18,8 +18,17 @@ export interface GaugeRead {
   level: number | null;
   confidence: number | null;
   notes: string;
+  /** Photo problems the model reported. Any of them stops an AI-only accept. */
+  issues: string[];
   mode: "live" | "mock";
 }
+
+/**
+ * A photo the model itself called blurry, glary or choppy is not something to
+ * auto-accept, however sure the model sounds: confidence is capped below the
+ * solo-accept threshold so a person looks at it.
+ */
+export const DEGRADED_CONFIDENCE_CAP = 0.8;
 
 export type ImageMediaType = "image/jpeg" | "image/png" | "image/webp" | "image/gif";
 
@@ -29,24 +38,29 @@ export function parseDataUrl(dataUrl: string): { mediaType: ImageMediaType; base
   return { mediaType: m[1] as ImageMediaType, base64: m[2] };
 }
 
-const clamp01 = (n: number) => Math.min(1, Math.max(0, n));
+const clamp01 = (n: number) => Math.min(1, Math.max(0, Number.isFinite(n) ? n : 0));
 
 /** Turn the model's structured answer into a GaugeRead, rejecting impossible values. */
 export function interpretGaugeOutput(out: GaugeReadingOutput, station: Station): GaugeRead {
-  const issues = out.issues.length ? ` Issues: ${out.issues.join(", ")}.` : "";
-  const notes = `${out.waterline_description}${issues}`.trim();
+  const issues = [...new Set(out.issues)];
+  const suffix = issues.length ? ` Issues: ${issues.join(", ")}.` : "";
+  const notes = `${out.waterline_description}${suffix}`.trim();
   if (!out.readable || out.level_m == null || !Number.isFinite(out.level_m)) {
-    return { level: null, confidence: clamp01(out.confidence), notes: notes || "Gauge not readable.", mode: "live" };
+    return { level: null, confidence: clamp01(out.confidence), notes: notes || "Gauge not readable.", issues, mode: "live" };
   }
   if (out.level_m < station.gaugeMin - 1 || out.level_m > station.gaugeMax + 1) {
     return {
       level: null,
       confidence: 0,
       notes: `Model reported ${out.level_m} m, outside this gauge (${station.gaugeMin}–${station.gaugeMax} m). ${notes}`,
+      issues,
       mode: "live",
     };
   }
-  return { level: Math.round(out.level_m * 100) / 100, confidence: clamp01(out.confidence), notes, mode: "live" };
+  const confidence = issues.length
+    ? Math.min(clamp01(out.confidence), DEGRADED_CONFIDENCE_CAP)
+    : clamp01(out.confidence);
+  return { level: Math.round(out.level_m * 100) / 100, confidence, notes, issues, mode: "live" };
 }
 
 /**
@@ -72,6 +86,7 @@ export async function readGauge(args: {
         level: Math.round((args.demoLevel + jitter) * 100) / 100,
         confidence: 0.9,
         notes: "Mock AI (no ANTHROPIC_API_KEY): level taken from the demo sample.",
+        issues: [],
         mode: "mock",
       };
     }
@@ -79,6 +94,7 @@ export async function readGauge(args: {
       level: null,
       confidence: null,
       notes: "Mock AI mode (no ANTHROPIC_API_KEY): photo was stored but not read.",
+      issues: [],
       mode: "mock",
     };
   }
@@ -110,14 +126,14 @@ export async function readGauge(args: {
     });
 
     if (response.stop_reason === "refusal") {
-      return { level: null, confidence: null, notes: "Model declined to read this photo.", mode: "live" };
+      return { level: null, confidence: null, notes: "Model declined to read this photo.", issues: [], mode: "live" };
     }
     if (!response.parsed_output) {
-      return { level: null, confidence: null, notes: `No structured answer (stop: ${response.stop_reason}).`, mode: "live" };
+      return { level: null, confidence: null, notes: `No structured answer (stop: ${response.stop_reason}).`, issues: [], mode: "live" };
     }
     return interpretGaugeOutput(response.parsed_output, station);
   } catch (e) {
     // The photo is still stored; a human can confirm the reading.
-    return { level: null, confidence: null, notes: `AI read failed: ${describeAiError(e)}`, mode: "live" };
+    return { level: null, confidence: null, notes: `AI read failed: ${describeAiError(e)}`, issues: [], mode: "live" };
   }
 }

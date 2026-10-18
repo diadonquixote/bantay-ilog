@@ -1,10 +1,13 @@
-import { classify, formatLevel, LEVELS } from "../levels";
-import type { Reading, ReadingSource, Station } from "../schemas";
+import { createHash } from "node:crypto";
+import { classify, formatLevel, LEVELS, rankOf } from "../levels";
+import type { Alert, LevelKey, Reading, ReadingSource, Station } from "../schemas";
 import { agree } from "./agree";
 import { type AgentOutcome, runAlertAgent } from "./alertAgent";
 import { type Db, newId, nowIso } from "./db";
 import { type Button, dashboardUrl, formatTime, type Notifier, notifyTeam } from "./notify";
 import type { GaugeRead } from "./readGauge";
+import { getStationStatus } from "./status";
+import { sendAlertChecked, ToolError } from "./tools";
 
 export interface IngestInput {
   station: Station;
@@ -12,9 +15,12 @@ export interface IngestInput {
   ai: GaugeRead | null;
   observerLevel: number | null;
   observerName: string | null;
+  /** Stable identity of the sender, used for the two-person rule. */
+  observerKey?: string | null;
   takenAt?: string;
   clientId?: string | null;
   photoPath?: string | null;
+  photoBytes?: Buffer | null;
 }
 
 export interface IngestResult {
@@ -24,7 +30,18 @@ export interface IngestResult {
   outcome: AgentOutcome | null;
   /** For readings that need confirmation: how many team chats were asked (0 = nobody set up). */
   teamNotified: number | null;
+  /** Hedged warnings sent to residents while an elevated reading waits for a human. */
+  provisional: Alert[];
 }
+
+export const photoHashOf = (bytes: Buffer): string => createHash("sha256").update(bytes).digest("hex");
+
+/** A person's stable identity for the two-person rule; names are compared case-insensitively. */
+export const identityKey = (name: string | null | undefined): string | null => {
+  const n = (name ?? "").trim();
+  if (!n) return null;
+  return n.toLowerCase().startsWith("tg:") ? n.toLowerCase() : `name:${n.toLowerCase().replace(/\s+/g, " ")}`;
+};
 
 export async function ingestReading(
   db: Db,
@@ -35,18 +52,24 @@ export async function ingestReading(
   const { station } = input;
   if (input.clientId) {
     const existing = await db.findReadingByClientId(station.id, input.clientId);
-    if (existing) return { reading: existing, duplicate: true, outcome: null, teamNotified: null };
+    if (existing) return { reading: existing, duplicate: true, outcome: null, teamNotified: null, provisional: [] };
   }
 
   const takenAt = input.takenAt ?? nowIso();
+  const photoHash = input.photoBytes ? photoHashOf(input.photoBytes) : null;
+  const dayAgo = new Date(Date.parse(takenAt) - 24 * 3_600_000).toISOString();
+  const reused = photoHash ? await db.findReadingByPhotoHash(station.id, photoHash, dayAgo) : null;
+
   const [previous] = await db.listReadings(station.id, { status: "accepted", limit: 1 });
   const decision = agree(
     {
       aiLevel: input.ai?.level ?? null,
       aiConfidence: input.ai?.confidence ?? null,
+      aiIssues: input.ai?.issues ?? [],
       observerLevel: input.observerLevel,
       previous: previous?.level != null ? { level: previous.level, takenAt: previous.takenAt } : null,
       takenAt,
+      duplicatePhotoOf: reused ? { takenAt: reused.takenAt } : null,
     },
     station,
   );
@@ -63,11 +86,14 @@ export async function ingestReading(
     aiNotes: input.ai?.notes ?? null,
     observerLevel: input.observerLevel,
     observerName: input.observerName,
+    observerKey: input.observerKey ?? identityKey(input.observerName),
     level: decision.level,
     status: decision.status,
     statusReason: decision.reason,
     photoPath: input.photoPath ?? null,
+    photoHash,
     confirmedBy: null,
+    confirmedByKey: null,
   });
 
   if (reading.status === "needs_confirmation") {
@@ -75,16 +101,67 @@ export async function ingestReading(
     if (teamNotified === 0) {
       console.warn(`[pipeline] ${station.id}: reading ${reading.id} needs confirmation but the station has no observer team`);
     }
-    return { reading, duplicate: false, outcome: null, teamNotified };
+    const provisional = await maybeProvisional(db, notifier, station, reading);
+    return { reading, duplicate: false, outcome: null, teamNotified, provisional };
   }
   if (reading.status === "accepted" && opts.runAgent !== false) {
-    return { reading, duplicate: false, outcome: await afterAccepted(db, notifier, station, reading), teamNotified: null };
+    return {
+      reading,
+      duplicate: false,
+      outcome: await afterAccepted(db, notifier, station, reading),
+      teamNotified: null,
+      provisional: [],
+    };
   }
-  return { reading, duplicate: false, outcome: null, teamNotified: null };
+  return { reading, duplicate: false, outcome: null, teamNotified: null, provisional: [] };
 }
 
 export async function afterAccepted(db: Db, notifier: Notifier, station: Station, reading: Reading) {
   return runAlertAgent({ db, notifier, station, readingId: reading.id, now: new Date(), sent: [] });
+}
+
+/**
+ * The cautious half of a disagreement.
+ *
+ * When two sources disagree, the lower of them is still a reading somebody took
+ * at the river. If even that lower value is above a threshold residents have not
+ * been warned about, they are told now — hedged, and explicitly "being checked" —
+ * rather than waiting for a volunteer to pick up their phone. The confirmed
+ * alert follows when the reading is confirmed.
+ */
+export async function maybeProvisional(
+  db: Db,
+  notifier: Notifier,
+  station: Station,
+  reading: Reading,
+): Promise<Alert[]> {
+  const candidates = [reading.aiLevel, reading.observerLevel].filter((v): v is number => v != null);
+  if (!candidates.length) return [];
+  const cautious = Math.min(...candidates);
+  const stage: LevelKey = classify(cautious, station.thresholds);
+  if (rankOf(stage) === 0) return [];
+
+  const now = new Date();
+  const status = await getStationStatus(db, station, now);
+  // Only if this is news: above what the gauge last confirmed and above what residents were last told.
+  const knownRank = Math.max(rankOf(status.stage ?? "normal"), rankOf(status.lastAlert?.level ?? "normal"));
+  if (rankOf(stage) <= knownRank) return [];
+  if (status.latest && Date.parse(reading.takenAt) <= Date.parse(status.latest.takenAt)) return [];
+
+  const ctx = { db, notifier, station, readingId: reading.id, now, sent: [] as Alert[] };
+  try {
+    await sendAlertChecked(ctx, {
+      level: stage,
+      kind: "provisional",
+      origin: "rule",
+      status,
+      pending: { level: Math.max(...candidates), stage: classify(Math.max(...candidates), station.thresholds) },
+    });
+  } catch (e) {
+    if (!(e instanceof ToolError)) throw e;
+    console.warn(`[pipeline] ${station.id}: provisional warning held back: ${e.message}`);
+  }
+  return ctx.sent;
 }
 
 async function requestConfirmation(notifier: Notifier, station: Station, r: Reading, urgent: boolean): Promise<number> {
@@ -125,16 +202,23 @@ export class ConfirmError extends Error {
 export async function confirmReading(
   db: Db,
   notifier: Notifier,
-  args: { readingId: string; action: "accept" | "reject"; level?: number; confirmedBy: string },
+  args: { readingId: string; action: "accept" | "reject"; level?: number; confirmedBy: string; confirmedByKey?: string | null },
 ): Promise<{ reading: Reading; outcome: AgentOutcome | null }> {
   const reading = await db.getReading(args.readingId);
   if (!reading) throw new ConfirmError("Reading not found.", 404);
   if (reading.status !== "needs_confirmation") {
     throw new ConfirmError(`Reading is already ${reading.status.replace("_", " ")}.`, 409);
   }
-  if (reading.observerName && reading.observerName === args.confirmedBy) {
+
+  // Two-person rule: compare stable identities, not free text, so retyping a
+  // different spelling of your own name does not get you past it.
+  const confirmerKey = args.confirmedByKey ?? identityKey(args.confirmedBy);
+  const observerKey = reading.observerKey ?? identityKey(reading.observerName);
+  if (!confirmerKey) throw new ConfirmError("Enter your name before confirming a reading.", 400);
+  if (observerKey && observerKey === confirmerKey) {
     throw new ConfirmError("A reading must be confirmed by someone other than the observer who sent it.", 403);
   }
+
   const station = await db.getStation(reading.stationId);
   if (!station) throw new ConfirmError("Station not found.", 404);
 
@@ -143,6 +227,7 @@ export async function confirmReading(
       status: "rejected",
       statusReason: `Rejected by ${args.confirmedBy}. ${reading.statusReason}`,
       confirmedBy: args.confirmedBy,
+      confirmedByKey: confirmerKey,
     });
     return { reading: updated!, outcome: null };
   }
@@ -157,6 +242,7 @@ export async function confirmReading(
     level: Math.round(level * 100) / 100,
     statusReason: `Confirmed by ${args.confirmedBy} (${reading.statusReason})`,
     confirmedBy: args.confirmedBy,
+    confirmedByKey: confirmerKey,
   });
   const outcome = await afterAccepted(db, notifier, station, updated!);
   return { reading: updated!, outcome };

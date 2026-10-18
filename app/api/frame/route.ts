@@ -1,14 +1,18 @@
 import { after } from "next/server";
 import { FrameRequest } from "@/lib/schemas";
 import { aiMode } from "@/lib/server/ai";
-import { badRequest } from "@/lib/server/auth";
+import { adminRequired, badRequest, isAdmin, tooManyRequests } from "@/lib/server/auth";
 import { getDb, newId } from "@/lib/server/db";
 import { getNotifier } from "@/lib/server/notify";
-import { afterAccepted, ingestReading } from "@/lib/server/pipeline";
+import { afterAccepted, identityKey, ingestReading } from "@/lib/server/pipeline";
+import { clientKey, rateLimit } from "@/lib/server/rateLimit";
 import { parseDataUrl, readGauge } from "@/lib/server/readGauge";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 120;
+
+/** One photo per 20 s per device, with a little burst room for a flushed offline queue. */
+const LIMIT = { limit: 6, windowSec: 120 };
 
 /**
  * POST a gauge photo (already cropped on the device) plus the observer's own
@@ -19,6 +23,9 @@ export const maxDuration = 120;
  * agent runs after the response is sent so field phones aren't kept waiting.
  */
 export async function POST(req: Request) {
+  const wait = rateLimit(`frame:${clientKey(req)}`, LIMIT);
+  if (wait != null) return tooManyRequests(wait);
+
   const parsed = FrameRequest.safeParse(await req.json().catch(() => null));
   if (!parsed.success) return badRequest(parsed.error);
   const body = parsed.data;
@@ -47,7 +54,7 @@ export async function POST(req: Request) {
 
   const ai = await readGauge({ imageDataUrl: body.image, station, demoLevel: body.demoLevel });
   const notifier = getNotifier(db);
-  const wait = new URL(req.url).searchParams.get("wait") === "1";
+  const waitForAgent = new URL(req.url).searchParams.get("wait") === "1";
 
   const result = await ingestReading(
     db,
@@ -58,14 +65,16 @@ export async function POST(req: Request) {
       ai,
       observerLevel: body.observerLevel ?? null,
       observerName: body.observerName ?? null,
+      observerKey: identityKey(body.observerName ?? null),
       takenAt: body.takenAt,
       clientId: body.clientId,
       photoPath,
+      photoBytes: bytes,
     },
-    { runAgent: wait },
+    { runAgent: waitForAgent },
   );
 
-  if (!wait && !result.duplicate && result.reading.status === "accepted") {
+  if (!waitForAgent && !result.duplicate && result.reading.status === "accepted") {
     after(() =>
       afterAccepted(db, notifier, station, result.reading).catch((e) => console.error("[frame] alert step failed", e)),
     );
@@ -74,8 +83,14 @@ export async function POST(req: Request) {
   return Response.json({ ...result, ai, aiMode: aiMode() }, { status: result.duplicate ? 200 : 201 });
 }
 
-/** GET ?readingId=… returns the stored photo for that reading. */
+/**
+ * GET ?readingId=… returns the stored photo for that reading.
+ *
+ * Gauge photos show a riverbank, often with houses and people in frame, so they
+ * are for the team that confirms readings, not for anyone with the link.
+ */
 export async function GET(req: Request) {
+  if (!isAdmin(req)) return adminRequired();
   const id = new URL(req.url).searchParams.get("readingId");
   if (!id) return badRequest("readingId is required");
   const db = getDb();
@@ -84,6 +99,6 @@ export async function GET(req: Request) {
   const photo = await db.loadPhoto(reading.photoPath);
   if (!photo) return Response.json({ error: "Photo missing from storage." }, { status: 404 });
   return new Response(new Uint8Array(photo.bytes), {
-    headers: { "content-type": photo.contentType, "cache-control": "private, max-age=86400" },
+    headers: { "content-type": photo.contentType, "cache-control": "private, no-store" },
   });
 }

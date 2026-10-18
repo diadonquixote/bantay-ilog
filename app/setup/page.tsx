@@ -13,8 +13,22 @@ const blank: Station = {
   gaugeMax: 10,
   thresholds: { alert: 5, alarm: 6, critical: 7 },
   tolerance: 0.1,
+  maxRatePerHour: 2,
+  evacuationCenter: "",
+  hotline: "",
   teamChatIds: [],
 };
+
+interface System {
+  ai: string;
+  model: string | null;
+  db: string;
+  telegram: string;
+  adminTokenRequired: boolean;
+  adminOpen: boolean;
+  isAdmin: boolean;
+  lastTick: string | null;
+}
 
 export default function SetupPage() {
   const [stations, setStations] = useState<Station[]>([]);
@@ -22,17 +36,12 @@ export default function SetupPage() {
   const [team, setTeam] = useState("");
   const [msg, setMsg] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
   const [token, setToken] = useAdminToken();
-  const [adminRequired, setAdminRequired] = useState(false);
-  const [system, setSystem] = useState<{ ai: string; model: string | null; db: string; telegram: string } | null>(null);
+  const [system, setSystem] = useState<System | null>(null);
   const bot = process.env.NEXT_PUBLIC_TELEGRAM_BOT_USERNAME;
 
   const load = async () => {
-    const d = await api<{
-      stations: Station[];
-      system: { adminTokenRequired: boolean; ai: string; model: string | null; db: string; telegram: string };
-    }>("/api/readings");
+    const d = await api<{ stations: Station[]; system: System }>("/api/readings");
     setStations(d.stations);
-    setAdminRequired(d.system.adminTokenRequired);
     setSystem(d.system);
   };
   useEffect(() => {
@@ -40,9 +49,10 @@ export default function SetupPage() {
   }, []);
 
   const edit = (s: Station) => {
-    setForm(s);
+    setForm({ ...blank, ...s });
     setTeam(s.teamChatIds.join(", "));
     setMsg(null);
+    window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
   const num = (v: string) => (v === "" ? NaN : Number(v));
@@ -68,6 +78,8 @@ export default function SetupPage() {
     }
   };
 
+  const locked = system ? system.adminTokenRequired && !system.isAdmin : false;
+
   return (
     <>
       <h1>Setup</h1>
@@ -78,46 +90,78 @@ export default function SetupPage() {
           <ul className="small" style={{ margin: 0, paddingLeft: "1.2rem" }}>
             <li>
               <strong>AI gauge reading:</strong>{" "}
-              {system.ai === "live" ? `live (${system.model})` : "mock mode — set ANTHROPIC_API_KEY. Every real photo needs a human to confirm."}
+              {system.ai === "live"
+                ? `live (${system.model})`
+                : "mock mode — set ANTHROPIC_API_KEY. Every real photo needs a human to confirm."}
             </li>
             <li>
-              <strong>Database:</strong> {system.db === "supabase" ? "Supabase" : `local ${system.db} store — set SUPABASE_URL for production`}
+              <strong>Database:</strong>{" "}
+              {system.db === "supabase" ? "Supabase" : `local ${system.db} store — set SUPABASE_URL for production`}
             </li>
             <li>
-              <strong>Telegram:</strong> {system.telegram === "live" ? "live" : "messages are only logged — set TELEGRAM_BOT_TOKEN"}
+              <strong>Telegram:</strong>{" "}
+              {system.telegram === "live" ? "live" : "messages are only logged — set TELEGRAM_BOT_TOKEN"}
+            </li>
+            <li>
+              <strong>Background job:</strong>{" "}
+              {system.lastTick
+                ? `last ran ${new Date(system.lastTick).toLocaleString("en-PH", { timeZone: "Asia/Manila" })}`
+                : "never — reminders and the PAGASA check need npm run job:pagasa or a schedule hitting /api/cron"}
             </li>
           </ul>
-          {!adminRequired && (
+          {system.adminOpen && (
             <div className="notice warn small">
-              <strong>ADMIN_TOKEN is not set.</strong> Anyone who can open this site can edit stations and confirm or reject
-              readings. Set it before putting the app on the internet.
+              <strong>ADMIN_TOKEN is not set.</strong> Anyone who can open this site can edit stations and confirm or
+              reject readings. A production build refuses admin actions until you set it.
             </div>
           )}
+          <p className="small muted" style={{ margin: "0.5rem 0 0" }}>
+            Health check: <code>/api/health</code>
+          </p>
         </section>
       )}
 
-      {adminRequired && (
+      {system?.adminTokenRequired && (
         <div className="card">
           <label htmlFor="token">Admin token</label>
-          <input id="token" type="password" value={token} onChange={(e) => setToken(e.target.value)} placeholder="ADMIN_TOKEN" />
-          <p className="small muted">Saved in this browser only. Needed to edit stations and confirm readings.</p>
+          <input
+            id="token"
+            type="password"
+            value={token}
+            onChange={(e) => setToken(e.target.value)}
+            placeholder="ADMIN_TOKEN"
+            autoComplete="current-password"
+          />
+          <div className="row" style={{ marginTop: "0.5rem" }}>
+            <button className="secondary" onClick={() => load().catch((e) => setMsg({ kind: "error", text: (e as Error).message }))}>
+              Unlock
+            </button>
+            <span className="small muted">Saved in this browser only.</span>
+          </div>
         </div>
+      )}
+
+      {locked && (
+        <div className="notice warn">Enter the admin token above to see team chat IDs and edit stations.</div>
       )}
 
       <div className="grid" style={{ gridTemplateColumns: "minmax(240px, 1fr) minmax(300px, 2fr)" }}>
         <section className="card">
           <h2>Stations</h2>
           {stations.map((s) => (
-            <div key={s.id} className="row" style={{ justifyContent: "space-between", padding: "0.4rem 0", borderBottom: "1px solid var(--border)" }}>
+            <div key={s.id} className="row spread" style={{ padding: "0.5rem 0", borderBottom: "1px solid var(--border)" }}>
               <div>
                 <strong>{s.name}</strong>
                 <div className="small muted">
                   {s.id} · {s.thresholds.alert}/{s.thresholds.alarm}/{s.thresholds.critical} m
                 </div>
-                {s.id !== "demo" && s.teamChatIds.length === 0 && (
+                {s.id !== "demo" && !locked && s.teamChatIds.length === 0 && (
                   <div className="small" style={{ color: "var(--alarm)", fontWeight: 600 }}>
                     ⚠ No observer team — nobody gets confirmation requests
                   </div>
+                )}
+                {s.id !== "demo" && !s.evacuationCenter && (
+                  <div className="small muted">No evacuation center set — alerts can&apos;t say where to go</div>
                 )}
               </div>
               <button className="secondary" onClick={() => edit(s)}>
@@ -135,7 +179,15 @@ export default function SetupPage() {
           <div className="grid" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: "0 1rem" }}>
             <div>
               <label htmlFor="id">ID (used in links and Telegram)</label>
-              <input id="id" value={form.id} onChange={(e) => set("id", e.target.value)} disabled={!!form.createdAt} required pattern="[a-z0-9-]+" placeholder="sto-nino" />
+              <input
+                id="id"
+                value={form.id}
+                onChange={(e) => set("id", e.target.value)}
+                disabled={!!form.createdAt}
+                required
+                pattern="[a-z0-9-]+"
+                placeholder="sto-nino"
+              />
             </div>
             <div>
               <label htmlFor="name">Name</label>
@@ -173,12 +225,28 @@ export default function SetupPage() {
               <label htmlFor="tol">AI/observer tolerance (m)</label>
               <input id="tol" type="number" step="0.01" value={form.tolerance} onChange={(e) => set("tolerance", num(e.target.value))} />
             </div>
+            <div>
+              <label htmlFor="rate">Fastest plausible rise (m/h)</label>
+              <input id="rate" type="number" step="0.1" value={form.maxRatePerHour} onChange={(e) => set("maxRatePerHour", num(e.target.value))} />
+            </div>
           </div>
+
+          <label htmlFor="evac">Evacuation center (printed in 2nd/3rd alarm messages)</label>
+          <input
+            id="evac"
+            value={form.evacuationCenter}
+            onChange={(e) => set("evacuationCenter", e.target.value)}
+            placeholder="Barangay Hall covered court"
+          />
+          <label htmlFor="hotline">Hotline (printed in every alert)</label>
+          <input id="hotline" value={form.hotline} onChange={(e) => set("hotline", e.target.value)} placeholder="MDRRMO 0999-000-0000" />
+
           <label htmlFor="team">Observer team Telegram chat IDs</label>
           <textarea id="team" rows={2} value={team} onChange={(e) => setTeam(e.target.value)} placeholder="123456789, 987654321" />
           <p className="small muted" style={{ marginTop: 4 }}>
-            Team members receive confirmation requests and reading reminders, and can confirm readings from Telegram. Each person
-            gets their chat ID by sending <code>/myid</code> to the bot.
+            Team members receive confirmation requests and reading reminders, and can confirm readings from Telegram.
+            Each person gets their ID by sending <code>/myid</code> to the bot. In a group, use each person&apos;s own
+            user ID so the two-person rule still works.
           </p>
           {msg && <div className={`notice ${msg.kind}`}>{msg.text}</div>}
           <button type="submit" style={{ marginTop: "0.5rem" }}>
@@ -191,7 +259,12 @@ export default function SetupPage() {
         <h2>Telegram</h2>
         <ol className="steps small">
           <li>
-            Create a bot with <a href="https://t.me/BotFather">@BotFather</a> and put the token in <code>TELEGRAM_BOT_TOKEN</code>.
+            Create a bot with <a href="https://t.me/BotFather">@BotFather</a> and put the token in{" "}
+            <code>TELEGRAM_BOT_TOKEN</code>.
+          </li>
+          <li>
+            Set <code>TELEGRAM_WEBHOOK_SECRET</code> to a long random string. It is required: without it anyone who
+            finds the webhook URL could confirm readings and trigger alerts.
           </li>
           <li>
             Point the bot at this server:{" "}
@@ -206,7 +279,9 @@ export default function SetupPage() {
                 .filter((s) => s.id !== "demo")
                 .map((s) => (
                   <span key={s.id}>
-                    <a href={`https://t.me/${bot}?start=${s.id}`}>t.me/{bot}?start={s.id}</a>{" "}
+                    <a href={`https://t.me/${bot}?start=${s.id}`}>
+                      t.me/{bot}?start={s.id}
+                    </a>{" "}
                   </span>
                 ))
             ) : (
@@ -215,6 +290,15 @@ export default function SetupPage() {
             .
           </li>
         </ol>
+      </section>
+
+      <section className="card">
+        <h2>Privacy</h2>
+        <ul className="small muted" style={{ margin: 0, paddingLeft: "1.2rem" }}>
+          <li>Gauge photos are served only to the observer team and deleted after PHOTO_RETENTION_DAYS (default 30).</li>
+          <li>Volunteer names are shown to the team; the public dashboard sees an initial only.</li>
+          <li>Residents&apos; Telegram chat IDs are stored only to send alerts and removed by /stop.</li>
+        </ul>
       </section>
     </>
   );

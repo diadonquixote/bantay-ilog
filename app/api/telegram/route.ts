@@ -1,23 +1,29 @@
-import { timingSafeEqual } from "node:crypto";
 import { formatLevel, LEVELS } from "@/lib/levels";
 import type { Station } from "@/lib/schemas";
+import { safeEqual } from "@/lib/server/auth";
 import { type Db, getDb, newId, nowIso } from "@/lib/server/db";
 import { formatTime, getNotifier, type Notifier } from "@/lib/server/notify";
 import { ConfirmError, confirmReading, ingestReading } from "@/lib/server/pipeline";
-import { getStationStatus } from "@/lib/server/status";
+import { getStationStatus, isStale } from "@/lib/server/status";
 import { describeTrend } from "@/lib/server/trend";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 120;
 
 interface TgUpdate {
-  message?: { chat: { id: number }; from?: { first_name?: string; username?: string }; text?: string };
+  message?: { chat: { id: number }; from?: { id?: number; first_name?: string; username?: string }; text?: string };
   callback_query?: {
     id: string;
     from: { id: number; first_name?: string; username?: string };
     message?: { chat: { id: number } };
     data?: string;
   };
+}
+
+interface Sender {
+  chatId: string;
+  userId: string;
+  name: string;
 }
 
 const HELP = [
@@ -29,6 +35,10 @@ const HELP = [
   "/stations — listahan ng istasyon / list stations",
 ].join("\n");
 
+const PRIVACY =
+  "\n\nPrivacy: iniimbak lang namin ang iyong chat ID para maipadala ang babala. " +
+  "We store only your chat ID so we can send alerts; send /stop any time to delete it.";
+
 const TEAM_HELP = [
   "",
   "Para sa observer team / For the observer team:",
@@ -38,12 +48,17 @@ const TEAM_HELP = [
 
 const OBSERVER_HINT = "\n\nVolunteer observer? Send /myid and give the number to your coordinator.";
 
+/**
+ * Telegram signs every webhook call with the secret given to setWebhook.
+ *
+ * Without it anyone who finds the URL can post a forged callback_query and
+ * confirm readings, which is what makes residents get alerted — so a bot that
+ * is actually configured must have a secret, and production always must.
+ */
 function secretOk(req: Request): boolean {
   const expected = process.env.TELEGRAM_WEBHOOK_SECRET;
-  if (!expected) return true;
-  const got = Buffer.from(req.headers.get("x-telegram-bot-api-secret-token") ?? "");
-  const want = Buffer.from(expected);
-  return got.length === want.length && timingSafeEqual(got, want);
+  if (!expected) return !process.env.TELEGRAM_BOT_TOKEN && process.env.NODE_ENV !== "production";
+  return safeEqual(req.headers.get("x-telegram-bot-api-secret-token") ?? "", expected);
 }
 
 async function statusText(db: Db, station: Station): Promise<string> {
@@ -58,22 +73,27 @@ async function statusText(db: Db, station: Station): Promise<string> {
     return `${station.name}: wala pang kumpirmadong sukat / no confirmed reading yet.${pendingLine}`;
   }
   const info = LEVELS[s.stage];
+  const staleLine = isStale(s)
+    ? `\n⚠️ Luma na ang sukat na ito (${s.ageMinutes} min). Hindi ito ang kasalukuyang lebel.\n` +
+      `This reading is ${s.ageMinutes} min old and may not reflect the river right now.`
+    : "";
   return (
     `${station.name} (${station.river})\n` +
     `${formatLevel(s.latest.level)} — ${formatTime(s.latest.takenAt)}\n` +
     `${info.labelTl} / ${info.label}\n` +
-    `Trend: ${describeTrend(s.trend)}${pendingLine}`
+    `Trend: ${describeTrend(s.trend)}${staleLine}${pendingLine}`
   );
 }
 
-async function handleMessage(db: Db, n: Notifier, chatId: string, who: string, text: string) {
+async function handleMessage(db: Db, n: Notifier, sender: Sender, text: string) {
+  const { chatId, who } = { chatId: sender.chatId, who: sender.name };
   const [rawCmd, ...args] = text.trim().split(/\s+/);
   const cmd = rawCmd.toLowerCase().replace(/@.*$/, "");
   const all = await db.listStations();
   // The demo station is for the /demo page only; residents never see it.
   const stations = all.filter((s) => s.id !== "demo");
   const find = (id?: string) => stations.find((s) => s.id === id?.toLowerCase());
-  const isTeam = all.some((s) => s.teamChatIds.includes(chatId));
+  const isTeam = all.some((s) => s.teamChatIds.includes(chatId) || s.teamChatIds.includes(sender.userId));
   const help = isTeam ? HELP + TEAM_HELP : HELP + OBSERVER_HINT;
 
   switch (cmd) {
@@ -88,7 +108,8 @@ async function handleMessage(db: Db, n: Notifier, chatId: string, who: string, t
       return n.send(
         chatId,
         `✅ Naka-subscribe ka na sa ${st.name}. Makakatanggap ka ng babala kapag tumaas ang ilog.\n` +
-          `You are subscribed to ${st.name}. You'll get alerts when the river rises.\n\n${await statusText(db, st)}`,
+          `You are subscribed to ${st.name}. You'll get alerts when the river rises.\n\n${await statusText(db, st)}` +
+          PRIVACY,
       );
     }
     case "/stop": {
@@ -105,18 +126,22 @@ async function handleMessage(db: Db, n: Notifier, chatId: string, who: string, t
     case "/stations":
       return n.send(chatId, stations.map((s) => `${s.id} — ${s.name} (${s.river})`).join("\n"));
     case "/myid":
-      return n.send(chatId, `Your chat ID: ${chatId}`);
+      return n.send(chatId, `Your chat ID: ${chatId}${sender.userId !== chatId ? `\nYour user ID: ${sender.userId}` : ""}`);
     case "/reading": {
       const st = find(args[0]);
       const level = Number(args[1]);
       if (!st || !Number.isFinite(level)) return n.send(chatId, "Usage: /reading <station> <level in metres>, e.g. /reading sto-nino 15.4");
-      if (!st.teamChatIds.includes(chatId)) return n.send(chatId, "Only the observer team for this station can send readings.");
+      if (!st.teamChatIds.includes(chatId) && !st.teamChatIds.includes(sender.userId)) {
+        return n.send(chatId, "Only the observer team for this station can send readings.");
+      }
       const res = await ingestReading(db, n, {
         station: st,
         source: "telegram",
         ai: null,
         observerLevel: level,
-        observerName: `tg:${chatId}`,
+        observerName: who || `tg:${sender.userId}`,
+        // The user id, not the chat id: in a group everyone shares one chat.
+        observerKey: `tg:${sender.userId}`,
       });
       return n.send(chatId, `Received ${level.toFixed(2)} m for ${st.name}. Status: ${res.reading.status.replace("_", " ")} — ${res.reading.statusReason}`);
     }
@@ -127,11 +152,12 @@ async function handleMessage(db: Db, n: Notifier, chatId: string, who: string, t
 
 async function handleCallback(db: Db, n: Notifier, cb: NonNullable<TgUpdate["callback_query"]>) {
   const chatId = String(cb.message?.chat.id ?? cb.from.id);
+  const userId = String(cb.from.id);
   const [kind, readingId, levelStr] = (cb.data ?? "").split(":");
   const reading = readingId ? await db.getReading(readingId) : null;
   const station = reading ? await db.getStation(reading.stationId) : null;
   if (!reading || !station) return n.answerCallback(cb.id, "Reading not found.");
-  if (!station.teamChatIds.includes(String(cb.from.id)) && !station.teamChatIds.includes(chatId)) {
+  if (!station.teamChatIds.includes(userId) && !station.teamChatIds.includes(chatId)) {
     return n.answerCallback(cb.id, "Only the observer team can confirm readings.");
   }
   try {
@@ -139,7 +165,8 @@ async function handleCallback(db: Db, n: Notifier, cb: NonNullable<TgUpdate["cal
       readingId,
       action: kind === "x" ? "reject" : "accept",
       level: kind === "c" ? Number(levelStr) : undefined,
-      confirmedBy: `tg:${cb.from.id}`,
+      confirmedBy: cb.from.first_name ? `${cb.from.first_name}` : `tg:${userId}`,
+      confirmedByKey: `tg:${userId}`,
     });
     await n.answerCallback(cb.id, r.status === "accepted" ? `Accepted ${formatLevel(r.level)}` : "Rejected");
     const alertNote = outcome?.alerts.length ? ` ${outcome.alerts.length} alert(s) sent to residents.` : "";
@@ -162,8 +189,13 @@ export async function POST(req: Request) {
       await handleCallback(db, n, update.callback_query);
     } else if (update.message?.text) {
       const m = update.message;
-      const who = m.from?.username ? `@${m.from.username}` : (m.from?.first_name ?? null);
-      await handleMessage(db, n, String(m.chat.id), who ?? "", m.text!);
+      const who = m.from?.username ? `@${m.from.username}` : (m.from?.first_name ?? "");
+      await handleMessage(
+        db,
+        n,
+        { chatId: String(m.chat.id), userId: String(m.from?.id ?? m.chat.id), name: who },
+        m.text!,
+      );
     }
   } catch (e) {
     // Always 200 so Telegram doesn't retry the same update forever.

@@ -1,10 +1,9 @@
 import type Anthropic from "@anthropic-ai/sdk";
-import { LEVELS, rankOf } from "../levels";
-import type { Alert, LevelKey } from "../schemas";
+import { ALL_CLEAR_MARGIN_M, rankOf } from "../levels";
+import type { Alert, AlertKind, LevelKey } from "../schemas";
 import { aiMode, describeAiError, FALLBACK_BETA, getAnthropic, loadPrompt, MODEL } from "./ai";
-import { formatTime } from "./notify";
-import { getStationStatus, type StationStatus } from "./status";
-import { executeTool, sendAlertChecked, TOOL_DEFS, type ToolContext, ToolError } from "./tools";
+import { getStationStatus, isStale, type StationStatus } from "./status";
+import { executeTool, renderAlert, sendAlertChecked, TOOL_DEFS, type ToolContext, ToolError } from "./tools";
 
 export interface AgentStep {
   tool: string;
@@ -39,82 +38,77 @@ export function shouldConsult(s: StationStatus, advisoryWarning: string | null):
   return null;
 }
 
-/** Deterministic bilingual alert text, used by rule mode and the safety net. */
-export function ruleMessage(s: StationStatus, kind: "stage" | "early" | "all-clear"): string {
-  const st = s.station;
-  const info = LEVELS[s.stage!];
-  const level = s.latest?.level?.toFixed(2) ?? "?";
-  const rate =
-    s.trend.ratePerHour != null ? ` (${s.trend.ratePerHour >= 0 ? "+" : ""}${s.trend.ratePerHour.toFixed(2)} m/h)` : "";
-  const when = s.latest ? formatTime(s.latest.takenAt) : "";
-  const title = `${st.name} — ${st.river}`;
+/** The river is above normal and higher than the last reading's stage or the last alert's stage. */
+export function isEscalation(s: StationStatus): boolean {
+  if (!s.stage || rankOf(s.stage) === 0) return false;
+  const r = rankOf(s.stage);
+  return !s.lastAlert || r > rankOf(s.lastAlert.level) || (s.previousStage != null && r > rankOf(s.previousStage));
+}
 
-  if (kind === "early" && s.trend.eta) {
-    // Early warning: lead with what is coming, not with the current (possibly "Normal") stage.
-    const next = LEVELS[s.trend.eta.key];
-    const { value, minutes } = s.trend.eta;
-    return (
-      `${rankOf(next.key) >= 3 ? "🚨" : "⚠️"} ${title}
-` +
-      `Tumataas ang ilog: ${level} m${rate}, ${when}. Maaaring umabot sa ${next.labelTl} (${value} m) sa loob ng ~${minutes} minuto. ${next.prepareTl}
-` +
-      `River rising: ${level} m${rate}. May reach ${next.label} (${value} m) in ~${minutes} min. ${next.prepare}`
-    );
-  }
-  if (kind === "all-clear") {
-    return (
-      `✅ ${title}
-` +
-      `Bumaba na ang ilog: ${level} m${rate}, ${when}. Normal na ang lebel. Patuloy na magbantay sa mga anunsyo.
-` +
-      `River back to normal: ${level} m${rate}. Keep listening for announcements.`
-    );
-  }
-  return (
-    `${rankOf(s.stage!) >= 2 ? "🚨" : "⚠️"} ${title}
-` +
-    `${info.labelTl}: ${level} m${rate}, ${when}.
-${info.actionTl}
-` +
-    `${info.label}: ${level} m${rate}. ${info.action}`
-  );
+/**
+ * An all-clear ends an emergency, so it needs more than one reading.
+ *
+ * A river sitting on the threshold would otherwise flip between "evacuate" and
+ * "all-clear" with every photo. Two readings in a row must be normal, and the
+ * water must be a clear margin below the alert line.
+ */
+export function canAllClear(s: StationStatus): boolean {
+  if (s.stage !== "normal" || !s.lastAlert || rankOf(s.lastAlert.level) === 0) return false;
+  if (s.lastAlert.kind === "all-clear") return false;
+  if (s.stageRun < 2) return false;
+  const level = s.latest?.level;
+  return level != null && level <= s.station.thresholds.alert - ALL_CLEAR_MARGIN_M;
+}
+
+/** The river fell to a lower stage that is still dangerous, and residents were told about the higher one. */
+export function isDeEscalation(s: StationStatus): boolean {
+  if (!s.stage || rankOf(s.stage) === 0 || !s.lastAlert) return false;
+  return rankOf(s.lastAlert.level) > rankOf(s.stage) && s.stageRun >= 2;
 }
 
 /** Returns null if sent, or the reason it was held back (e.g. a recent duplicate). */
-async function trySend(ctx: ToolContext, level: LevelKey, msg: string, steps: AgentStep[]): Promise<string | null> {
+async function trySend(
+  ctx: ToolContext,
+  args: { level: LevelKey; kind: AlertKind; status: StationStatus; from?: LevelKey | null },
+  steps: AgentStep[],
+): Promise<string | null> {
   try {
-    await sendAlertChecked(ctx, level, msg, "rule");
-    steps.push({ tool: "send_alert", input: { level }, result: "sent", isError: false });
+    await sendAlertChecked(ctx, { ...args, origin: "rule" });
+    steps.push({ tool: "send_alert", input: { level: args.level, kind: args.kind }, result: "sent", isError: false });
     return null;
   } catch (e) {
     if (!(e instanceof ToolError)) throw e;
-    steps.push({ tool: "send_alert", input: { level }, result: e.message, isError: true });
+    steps.push({ tool: "send_alert", input: { level: args.level, kind: args.kind }, result: e.message, isError: true });
     return e.message;
   }
 }
 
 const sentOr = (held: string | null, what: string) => (held ? `${what} held back: ${held}` : `sent ${what}.`);
 
-/** The no-AI policy: stage escalations, early warnings and all-clears. */
+/** The no-AI policy: stage escalations, early warnings, de-escalations and all-clears. */
 async function runRules(ctx: ToolContext, s: StationStatus): Promise<AgentOutcome> {
   const steps: AgentStep[] = [];
   const stage = s.stage!;
   let summary: string;
 
   if (isEscalation(s)) {
-    summary = `Stage ${stage}: ${sentOr(await trySend(ctx, stage, ruleMessage(s, "stage"), steps), "stage alert")}`;
+    summary = `Stage ${stage}: ${sentOr(await trySend(ctx, { level: stage, kind: "stage", status: s }, steps), "stage alert")}`;
   } else if (s.trend.direction === "rising" && s.trend.eta && s.trend.eta.minutes <= 120) {
     const eta = s.trend.eta;
-    summary = `Rising toward ${eta.key} in ~${eta.minutes} min: ${sentOr(await trySend(ctx, stage, ruleMessage(s, "early"), steps), "early warning")}`;
+    summary = `Rising toward ${eta.key} in ~${eta.minutes} min: ${sentOr(await trySend(ctx, { level: stage, kind: "early", status: s }, steps), "early warning")}`;
+  } else if (isDeEscalation(s)) {
+    summary = `Fell to ${stage} but still dangerous: ${sentOr(await trySend(ctx, { level: stage, kind: "de-escalation", status: s, from: s.lastAlert?.level }, steps), "de-escalation notice")}`;
+  } else if (canAllClear(s)) {
+    summary = `Back to normal: ${sentOr(await trySend(ctx, { level: stage, kind: "all-clear", status: s }, steps), "all-clear")}`;
   } else if (stage === "normal" && s.lastAlert && rankOf(s.lastAlert.level) > 0) {
-    summary = `Back to normal: ${sentOr(await trySend(ctx, stage, ruleMessage(s, "all-clear"), steps), "all-clear")}`;
+    summary = `Normal again but waiting for a second confirming reading before the all-clear (${s.stageRun} so far); no alert.`;
   } else {
     summary = `Stage ${stage}, no new information for residents; no alert.`;
   }
   return { mode: "rule", summary, steps, alerts: [...ctx.sent], safetyNet: [] };
 }
 
-async function runClaude(ctx: ToolContext, trigger: string): Promise<AgentOutcome> {
+async function runClaude(ctx: ToolContext, trigger: string, s: StationStatus): Promise<AgentOutcome> {
   const client = getAnthropic();
   const steps: AgentStep[] = [];
   const messages: Anthropic.Beta.BetaMessageParam[] = [
@@ -169,6 +163,7 @@ async function runClaude(ctx: ToolContext, trigger: string): Promise<AgentOutcom
     messages.push({ role: "user", content: results });
   }
 
+  void s;
   return { mode: "agent", summary: summary || "Agent finished without a summary.", steps, alerts: [...ctx.sent], safetyNet: [] };
 }
 
@@ -178,36 +173,46 @@ async function runClaude(ctx: ToolContext, trigger: string): Promise<AgentOutcom
  * within the duplicate window), send the deterministic one.
  */
 async function safetyNet(ctx: ToolContext, s: StationStatus): Promise<Alert[]> {
-  if (!s.stage || !isEscalation(s) || ctx.sent.some((a) => a.level === s.stage)) return [];
+  if (!s.stage || !isEscalation(s) || ctx.sent.some((a) => a.level === s.stage && a.kind === "stage")) return [];
   const before = ctx.sent.length;
   // sendAlertChecked still refuses a duplicate inside the stage's repeat window.
-  await trySend(ctx, s.stage, ruleMessage(s, "stage"), []);
+  await trySend(ctx, { level: s.stage, kind: "stage", status: s }, []);
   return ctx.sent.slice(before);
 }
 
-/** The river is above normal and higher than the last reading's stage or the last alert's stage. */
-export function isEscalation(s: StationStatus): boolean {
-  if (!s.stage || rankOf(s.stage) === 0) return false;
-  const r = rankOf(s.stage);
-  return (
-    !s.lastAlert ||
-    r > rankOf(s.lastAlert.level) ||
-    (s.previousStage != null && r > rankOf(s.previousStage))
-  );
+/**
+ * Which model does the thinking.
+ *
+ * Routine cases — a plain escalation, an all-clear, a quiet river — are decided
+ * by the rules, which are tested and free. The agent is kept for the judgement
+ * calls: conflicting signals, a rainfall warning, a river hovering at a
+ * threshold. That also keeps a flood night from becoming one agent run per
+ * reading.
+ */
+export function needsJudgement(s: StationStatus, advisoryWarning: string | null): boolean {
+  if (isStale(s)) return false;
+  const rising = s.trend.direction === "rising";
+  const nearThreshold = s.trend.eta != null && s.trend.eta.minutes <= 120;
+  const wetWarning = advisoryWarning === "orange" || advisoryWarning === "red";
+  // A clean escalation or a settled all-clear needs no deliberation.
+  if (isEscalation(s) && !nearThreshold) return false;
+  if (canAllClear(s)) return false;
+  return rising || nearThreshold || wetWarning || isDeEscalation(s) || s.pendingConfirmations > 0;
 }
 
 export async function runAlertAgent(ctx: ToolContext, opts: { force?: boolean } = {}): Promise<AgentOutcome> {
   const status = await getStationStatus(ctx.db, ctx.station, ctx.now);
   const advisory = await ctx.db.latestAdvisory();
-  const trigger = shouldConsult(status, advisory?.warning ?? null) ?? (opts.force ? "manual run" : null);
+  const warning = advisory?.warning ?? null;
+  const trigger = shouldConsult(status, warning) ?? (opts.force ? "manual run" : null);
   if (!trigger) {
     return { mode: "skipped", summary: "Normal and steady; alert agent not consulted.", steps: [], alerts: [], safetyNet: [] };
   }
 
   let outcome: AgentOutcome;
-  if (aiMode() === "live") {
+  if (aiMode() === "live" && needsJudgement(status, warning)) {
     try {
-      outcome = await runClaude(ctx, trigger);
+      outcome = await runClaude(ctx, trigger, status);
     } catch (e) {
       console.error(`[alertAgent] Claude agent failed, using rules: ${describeAiError(e)}`);
       outcome = await runRules(ctx, status);
@@ -222,3 +227,6 @@ export async function runAlertAgent(ctx: ToolContext, opts: { force?: boolean } 
   outcome.alerts = [...ctx.sent];
   return outcome;
 }
+
+/** Exposed for the dashboard preview and tests: the text a given alert would carry. */
+export { renderAlert };

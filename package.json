@@ -12,7 +12,9 @@
     "typecheck": "tsc --noEmit",
     "test:photos": "tsx scripts/test-photos.ts",
     "job:pagasa": "tsx jobs/pagasa-check/index.ts",
-    "samples": "tsx scripts/make-samples.ts"
+    "samples": "tsx scripts/make-samples.ts",
+    "lint": "eslint .",
+    "check": "npm run typecheck && npm test && npm run lint"
   },
   "engines": {
     "node": ">=20"
@@ -26,9 +28,12 @@
     "zod": "^4.6.7"
   },
   "devDependencies": {
+    "@eslint/eslintrc": "^3.3.1",
     "@types/node": "^22.20.5",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
+    "eslint": "^9.39.0",
+    "eslint-config-next": "^16.4.2",
     "tsx": "^4.23.15",
     "typescript": "^5.9.3",
     "vitest": "^4.1.12"

@@ -68,4 +68,54 @@ describe("agree", () => {
     const r = agree({ aiLevel: 15.0, aiConfidence: 0.95, observerLevel: 15.02, previous, takenAt: at }, st);
     expect(r.status).toBe("accepted");
   });
+
+  it("gives a flash flood more room when both sources read the same number", () => {
+    const previous = { level: 13.8, takenAt: "2026-10-17T09:30:00.000Z" };
+    // 2.4 m/h: above the station limit, but two people and the AI agree on it.
+    const agreed = agree({ aiLevel: 15.0, aiConfidence: 0.95, observerLevel: 15.0, previous, takenAt: at }, st);
+    expect(agreed.status).toBe("accepted");
+    // The same jump from the AI alone still waits for a human.
+    const solo = agree({ aiLevel: 15.0, aiConfidence: 0.95, observerLevel: null, previous, takenAt: at }, st);
+    expect(solo.status).toBe("needs_confirmation");
+    expect(solo.reason).toMatch(/implausibly fast/);
+  });
+
+  it("holds an AI-only reading from a photo the model itself called bad", () => {
+    const r = agree(
+      { aiLevel: 14.2, aiConfidence: 0.99, aiIssues: ["glare", "waves"], observerLevel: null, takenAt: at },
+      st,
+    );
+    expect(r.status).toBe("needs_confirmation");
+    expect(r.reason).toMatch(/glare/);
+  });
+
+  it("photo problems do not override an observer who agrees", () => {
+    const r = agree(
+      { aiLevel: 14.2, aiConfidence: 0.7, aiIssues: ["glare"], observerLevel: 14.25, takenAt: at },
+      st,
+    );
+    expect(r.status).toBe("accepted");
+  });
+
+  it("holds a photo that was already sent", () => {
+    const r = agree(
+      {
+        aiLevel: 14.2,
+        aiConfidence: 0.95,
+        observerLevel: 14.2,
+        takenAt: at,
+        duplicatePhotoOf: { takenAt: "2026-10-17T09:00:00.000Z" },
+      },
+      st,
+    );
+    expect(r.status).toBe("needs_confirmation");
+    expect(r.reason).toMatch(/already sent/);
+  });
+
+  it("respects a station's own idea of a plausible rise", () => {
+    const slow = { ...st, maxRatePerHour: 0.5 };
+    const previous = { level: 14.5, takenAt: "2026-10-17T09:30:00.000Z" };
+    const r = agree({ aiLevel: 15.0, aiConfidence: 0.95, observerLevel: 15.0, previous, takenAt: at }, slow);
+    expect(r.status).toBe("needs_confirmation");
+  });
 });

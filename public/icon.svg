@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192" role="img" aria-label="Bantay Ilog">
+  <rect width="192" height="192" rx="40" fill="#1864ab"/>
+  <rect x="78" y="26" width="36" height="120" rx="4" fill="#f8f8f4"/>
+  <g fill="#d62828">
+    <rect x="84" y="38" width="24" height="10"/>
+    <rect x="84" y="58" width="24" height="10"/>
+    <rect x="84" y="78" width="24" height="10"/>
+    <rect x="84" y="98" width="24" height="10"/>
+  </g>
+  <path d="M0 126c24 0 24 12 48 12s24-12 48-12 24 12 48 12 24-12 48-12v66H0z" fill="#4dabf7" opacity="0.95"/>
+  <path d="M0 146c24 0 24 12 48 12s24-12 48-12 24 12 48 12 24-12 48-12v46H0z" fill="#1c7ed6"/>
+</svg>

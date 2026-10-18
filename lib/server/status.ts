@@ -9,6 +9,10 @@ export interface StationStatus {
   stage: LevelKey | null;
   /** Stage of the accepted reading before the latest one. */
   previousStage: LevelKey | null;
+  /** How many of the most recent accepted readings in a row share the current stage. */
+  stageRun: number;
+  /** Age of the latest confirmed reading, in minutes. */
+  ageMinutes: number | null;
   trend: Trend;
   pendingConfirmations: number;
   /** The highest value among readings still waiting for confirmation (AI or observer, whichever is higher). */
@@ -17,6 +21,9 @@ export interface StationStatus {
 }
 
 const HOUR = 3_600_000;
+
+/** A reading older than this is not a picture of the river right now. */
+export const STALE_AFTER_MIN = 90;
 
 export async function getStationStatus(db: Db, station: Station, now = new Date()): Promise<StationStatus> {
   const accepted = await db.listReadings(station.id, {
@@ -40,14 +47,30 @@ export async function getStationStatus(db: Db, station: Station, now = new Date(
   const points = accepted.filter((r) => r.level != null).map((r) => ({ level: r.level!, takenAt: r.takenAt }));
   const latest = accepted[0] ?? null;
   const prev = accepted[1] ?? null;
+  const stage = latest?.level != null ? classify(latest.level, station.thresholds) : null;
+
+  let stageRun = 0;
+  if (stage) {
+    for (const r of accepted) {
+      if (r.level == null || classify(r.level, station.thresholds) !== stage) break;
+      stageRun++;
+    }
+  }
+
   return {
     station,
     latest,
-    stage: latest?.level != null ? classify(latest.level, station.thresholds) : null,
+    stage,
     previousStage: prev?.level != null ? classify(prev.level, station.thresholds) : null,
+    stageRun,
+    ageMinutes: latest ? Math.round((now.getTime() - Date.parse(latest.takenAt)) / 60_000) : null,
     trend: computeTrend(points, station.thresholds, { now }),
     pendingConfirmations: pending.length,
     pendingHighest,
     lastAlert: alerts[0] ?? null,
   };
+}
+
+export function isStale(s: StationStatus): boolean {
+  return s.ageMinutes != null && s.ageMinutes > STALE_AFTER_MIN;
 }

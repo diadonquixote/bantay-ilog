@@ -1,4 +1,4 @@
-import type { Station } from "../schemas";
+import type { OutboxMessage, Station } from "../schemas";
 import { type Db, newId, nowIso } from "./db";
 
 export interface Button {
@@ -6,11 +6,27 @@ export interface Button {
   data: string;
 }
 
+export interface SendResult {
+  ok: boolean;
+  /** The chat blocked the bot or no longer exists: stop sending to it. */
+  blocked?: boolean;
+  error?: string;
+}
+
 export interface Notifier {
   readonly mode: "telegram" | "log";
-  send(chatId: string, text: string, buttons?: Button[][]): Promise<boolean>;
+  send(chatId: string, text: string, buttons?: Button[][]): Promise<SendResult>;
+  /** Retry a message already in the outbox, without creating a second record. */
+  resend(m: OutboxMessage): Promise<SendResult>;
   answerCallback(callbackId: string, text: string): Promise<void>;
 }
+
+/** Retries left for a message that failed for a reason that might clear up. */
+export const OUTBOX_RETRIES = 3;
+
+class TelegramBlocked extends Error {}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** Sends through the Telegram Bot API; every message is also written to the outbox. */
 export class TelegramNotifier implements Notifier {
@@ -20,34 +36,79 @@ export class TelegramNotifier implements Notifier {
     private readonly token: string,
   ) {}
 
-  private async call(method: string, body: unknown) {
+  private async call(method: string, body: unknown, retryOn429 = true): Promise<void> {
     const res = await fetch(`https://api.telegram.org/bot${this.token}/${method}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(10_000),
     });
-    const json = (await res.json().catch(() => ({}))) as { ok?: boolean; description?: string };
-    if (!res.ok || !json.ok) throw new Error(json.description || `Telegram HTTP ${res.status}`);
+    const json = (await res.json().catch(() => ({}))) as {
+      ok?: boolean;
+      description?: string;
+      error_code?: number;
+      parameters?: { retry_after?: number };
+    };
+    if (res.ok && json.ok) return;
+
+    // Telegram throttles broadcasts; it tells us exactly how long to wait.
+    const retryAfter = json.parameters?.retry_after;
+    if ((res.status === 429 || json.error_code === 429) && retryOn429 && retryAfter != null && retryAfter <= 30) {
+      await sleep((retryAfter + 1) * 1000);
+      return this.call(method, body, false);
+    }
+    // 403 = bot blocked or kicked; 400 "chat not found" = the id is gone.
+    if (json.error_code === 403 || /chat not found|user is deactivated/i.test(json.description ?? "")) {
+      throw new TelegramBlocked(json.description || "chat unreachable");
+    }
+    throw new Error(json.description || `Telegram HTTP ${res.status}`);
   }
 
-  async send(chatId: string, text: string, buttons?: Button[][]) {
+  private payload(chatId: string, text: string, buttons?: Button[][]) {
+    return {
+      chat_id: chatId,
+      text,
+      disable_web_page_preview: true,
+      reply_markup: buttons
+        ? { inline_keyboard: buttons.map((row) => row.map((b) => ({ text: b.text, callback_data: b.data }))) }
+        : undefined,
+    };
+  }
+
+  async send(chatId: string, text: string, buttons?: Button[][]): Promise<SendResult> {
     let error: string | null = null;
+    let blocked = false;
     try {
-      await this.call("sendMessage", {
-        chat_id: chatId,
-        text,
-        disable_web_page_preview: true,
-        reply_markup: buttons
-          ? { inline_keyboard: buttons.map((row) => row.map((b) => ({ text: b.text, callback_data: b.data }))) }
-          : undefined,
-      });
+      await this.call("sendMessage", this.payload(chatId, text, buttons));
     } catch (e) {
+      blocked = e instanceof TelegramBlocked;
       error = e instanceof Error ? e.message : String(e);
-      console.error(`[notify] telegram send to ${chatId} failed: ${error}`);
+      console.error(`[notify] telegram send failed (${blocked ? "blocked" : "error"}): ${error}`);
     }
-    await this.db.insertOutbox({ id: newId(), chatId, text, delivered: !error, error, createdAt: nowIso() });
-    return !error;
+    await this.db.insertOutbox({
+      id: newId(),
+      chatId,
+      text,
+      delivered: !error,
+      error,
+      // A blocked chat will never work; anything else is worth another try from the job.
+      retries: error && !blocked ? OUTBOX_RETRIES : 0,
+      createdAt: nowIso(),
+    });
+    return { ok: !error, blocked, error: error ?? undefined };
+  }
+
+  async resend(m: OutboxMessage): Promise<SendResult> {
+    try {
+      await this.call("sendMessage", this.payload(m.chatId, m.text));
+      await this.db.updateOutbox(m.id, { delivered: true, error: null, retries: 0 });
+      return { ok: true };
+    } catch (e) {
+      const blocked = e instanceof TelegramBlocked;
+      const error = e instanceof Error ? e.message : String(e);
+      await this.db.updateOutbox(m.id, { error, retries: blocked ? 0 : Math.max(0, (m.retries ?? 1) - 1) });
+      return { ok: false, blocked, error };
+    }
   }
 
   async answerCallback(callbackId: string, text: string) {
@@ -62,11 +123,23 @@ export class LogNotifier implements Notifier {
   readonly mode = "log" as const;
   constructor(private readonly db: Db) {}
 
-  async send(chatId: string, text: string, buttons?: Button[][]) {
+  async send(chatId: string, text: string, buttons?: Button[][]): Promise<SendResult> {
     const btn = buttons ? `\n  [buttons: ${buttons.flat().map((b) => b.text).join(" | ")}]` : "";
     console.log(`[notify → ${chatId}] ${text.replace(/\n/g, "\n  ")}${btn}`);
-    await this.db.insertOutbox({ id: newId(), chatId, text: text + btn, delivered: false, error: null, createdAt: nowIso() });
-    return true;
+    await this.db.insertOutbox({
+      id: newId(),
+      chatId,
+      text: text + btn,
+      delivered: false,
+      error: null,
+      retries: 0,
+      createdAt: nowIso(),
+    });
+    return { ok: true };
+  }
+
+  async resend() {
+    return { ok: true };
   }
 
   async answerCallback() {}
@@ -82,6 +155,9 @@ class DemoAwareNotifier implements Notifier {
   send(chatId: string, text: string, buttons?: Button[][]) {
     return (chatId.startsWith("demo-") ? this.log : this.real).send(chatId, text, buttons);
   }
+  resend(m: OutboxMessage) {
+    return (m.chatId.startsWith("demo-") ? this.log : this.real).resend(m);
+  }
   answerCallback(callbackId: string, text: string) {
     return this.real.answerCallback(callbackId, text);
   }
@@ -92,19 +168,42 @@ export function getNotifier(db: Db): Notifier {
   return token ? new DemoAwareNotifier(new TelegramNotifier(db, token), new LogNotifier(db)) : new LogNotifier(db);
 }
 
-/** Message every resident subscribed to the station. Returns the number of chats reached. */
+/**
+ * Message every resident subscribed to the station. Returns the number of chats
+ * reached. A chat that has blocked the bot is unsubscribed so the next flood
+ * does not spend its first minutes retrying dead chats.
+ */
 export async function broadcastToSubscribers(db: Db, n: Notifier, stationId: string, text: string): Promise<number> {
   const subs = await db.listSubscribers(stationId);
   let sent = 0;
-  for (const s of subs) if (await n.send(s.chatId, text)) sent++;
+  for (const s of subs) {
+    const r = await n.send(s.chatId, text);
+    if (r.ok) sent++;
+    else if (r.blocked) {
+      await db.removeSubscriber(s.chatId, stationId);
+      console.warn(`[notify] unsubscribed a chat that blocked the bot (${stationId})`);
+    }
+  }
   return sent;
 }
 
 /** Message the station's observer team. */
 export async function notifyTeam(n: Notifier, station: Station, text: string, buttons?: Button[][]): Promise<number> {
   let sent = 0;
-  for (const chatId of station.teamChatIds) if (await n.send(chatId, text, buttons)) sent++;
+  for (const chatId of station.teamChatIds) if ((await n.send(chatId, text, buttons)).ok) sent++;
   return sent;
+}
+
+/** Try undelivered messages again. Called by the background job. */
+export async function deliverPending(db: Db, n: Notifier, limit = 50): Promise<{ sent: number; failed: number }> {
+  let sent = 0;
+  let failed = 0;
+  for (const m of await db.listOutboxPending(limit)) {
+    const r = await n.resend(m);
+    if (r.ok) sent++;
+    else failed++;
+  }
+  return { sent, failed };
 }
 
 export function formatTime(iso: string): string {

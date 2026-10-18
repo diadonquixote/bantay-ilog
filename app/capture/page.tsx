@@ -5,13 +5,14 @@ import { cameraSupported, fileToCanvas, grabFrame, startCamera, stopCamera } fro
 import { checkPhoto, type PhotoCheck } from "@/lib/client/colorCheck";
 import { cropCanvas, GUIDE_BOX, toJpegDataUrl } from "@/lib/client/crop";
 import { flushQueue, listQueued, newClientId, submitOrQueue } from "@/lib/client/offlineQueue";
-import { formatLevel, LEVELS } from "@/lib/levels";
-import type { Reading, Station } from "@/lib/schemas";
+import { classify, formatLevel, LEVELS } from "@/lib/levels";
+import type { Alert, Reading, Station } from "@/lib/schemas";
 
 interface FrameResponse {
   reading: Reading;
   duplicate: boolean;
   teamNotified: number | null;
+  provisional?: Alert[];
   ai: { level: number | null; confidence: number | null; notes: string; mode: string };
 }
 
@@ -48,6 +49,7 @@ export default function CapturePage() {
   const [queued, setQueued] = useState(0);
   const [sendError, setSendError] = useState<string | null>(null);
   const [aiMode, setAiMode] = useState<string>("live");
+  const [online, setOnline] = useState(true);
 
   const refreshQueue = useCallback(async () => {
     try {
@@ -72,6 +74,12 @@ export default function CapturePage() {
   }, [refreshQueue]);
 
   useEffect(() => {
+    const sync = () => setOnline(navigator.onLine);
+    sync();
+    const back = () => {
+      sync();
+      flush();
+    };
     fetch("/api/stations")
       .then((r) => r.json())
       .then((d: { stations: Station[] }) => {
@@ -84,15 +92,19 @@ export default function CapturePage() {
         } catch {}
         setStationId(real.find((s) => s.id === saved)?.id ?? real[0]?.id ?? "");
       })
-      .catch(() => setCamError("Could not load stations — are you offline? Saved readings will be sent later."));
+      .catch(() => setCamError("Could not load stations — you may be offline. Saved readings are sent later."));
     fetch("/api/readings")
       .then((r) => r.json())
       .then((d: { system?: { ai: string } }) => d.system && setAiMode(d.system.ai))
       .catch(() => {});
     refreshQueue();
     flush();
-    window.addEventListener("online", flush);
-    return () => window.removeEventListener("online", flush);
+    window.addEventListener("online", back);
+    window.addEventListener("offline", sync);
+    return () => {
+      window.removeEventListener("online", back);
+      window.removeEventListener("offline", sync);
+    };
   }, [flush, refreshQueue]);
 
   const openCamera = useCallback(async () => {
@@ -139,9 +151,15 @@ export default function CapturePage() {
     }
   };
 
+  const station = stations.find((s) => s.id === stationId);
+  const blocked = check && !check.ok;
+  const levelCheck = checkLevel(level, station);
+  // Without a working AI reader the volunteer's own reading is the only number we get.
+  const levelMissing = aiMode !== "live" && level.trim() === "";
+  const canSend = !!stationId && levelCheck.ok && !levelMissing;
+
   const send = async () => {
-    if (!photo || !stationId) return;
-    if (!levelCheck.ok || levelMissing) return;
+    if (!photo || !canSend) return;
     const lv = level.trim() === "" ? null : Number(level.replace(",", "."));
     try {
       localStorage.setItem("bantay-station", stationId);
@@ -158,10 +176,12 @@ export default function CapturePage() {
     };
     const r = await submitOrQueue("/api/frame", payload);
     if (r.status === "sent") {
-      const data = r.data as FrameResponse;
-      setResult({ kind: "sent", text: "Reading sent.", data });
+      setResult({ kind: "sent", text: "Reading sent.", data: r.data as FrameResponse });
     } else if (r.status === "queued") {
-      setResult({ kind: "queued", text: `No connection (${r.reason}). Saved on this phone; it will be sent automatically when you're back online.` });
+      setResult({
+        kind: "queued",
+        text: `No connection (${r.reason}). Saved on this phone and sent automatically when you are back online.`,
+      });
     } else {
       // Keep the photo so the volunteer can fix the problem and resend.
       setSendError(r.error);
@@ -181,22 +201,33 @@ export default function CapturePage() {
     setPhase("camera");
   };
 
-  const station = stations.find((s) => s.id === stationId);
-  const blocked = check && !check.ok;
-  const levelCheck = checkLevel(level, station);
-  // Without a working AI reader the volunteer's own reading is the only number we get.
-  const levelMissing = aiMode !== "live" && level.trim() === "";
+  const step = phase === "camera" ? 1 : phase === "done" ? 3 : 2;
 
   return (
     <>
       <h1>Take a gauge reading</h1>
-      <p className="muted" style={{ marginTop: 0 }}>
-        Kunan ng litrato ang gauge. Line the gauge up inside the box, make sure the waterline is visible, then capture.
+      <p className="muted small" style={{ marginTop: "-0.25rem" }}>
+        Kunan ng litrato ang gauge, isulat ang nakikita mong lebel, ipadala.
       </p>
 
+      <div className="steps-bar" aria-hidden>
+        <div className={step >= 1 ? "on" : ""} />
+        <div className={step >= 2 ? "on" : ""} />
+        <div className={step >= 3 ? "on" : ""} />
+      </div>
+
+      {!online && (
+        <div className="notice warn">
+          <strong>You are offline.</strong> You can still take readings — they are saved on this phone and sent
+          automatically when the signal comes back.
+        </div>
+      )}
+
       {queued > 0 && (
-        <div className="notice warn row" style={{ justifyContent: "space-between" }}>
-          <span>{queued} reading(s) saved on this phone, waiting for signal.</span>
+        <div className="notice warn row spread">
+          <span>
+            {queued} reading(s) saved on this phone, waiting for signal.
+          </span>
           <button className="secondary" onClick={flush}>
             Send now
           </button>
@@ -204,7 +235,7 @@ export default function CapturePage() {
       )}
 
       <div className="card">
-        <div className="grid" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))" }}>
+        <div className="grid">
           <div>
             <label htmlFor="station">Station</label>
             <select id="station" value={stationId} onChange={(e) => setStationId(e.target.value)}>
@@ -217,7 +248,16 @@ export default function CapturePage() {
           </div>
           <div>
             <label htmlFor="observer">Your name</label>
-            <input id="observer" value={observer} onChange={(e) => setObserver(e.target.value)} placeholder="e.g. Kagawad Reyes" />
+            <input
+              id="observer"
+              value={observer}
+              onChange={(e) => setObserver(e.target.value)}
+              placeholder="e.g. Kagawad Reyes"
+              autoComplete="name"
+            />
+            <p className="small muted" style={{ margin: "0.25rem 0 0" }}>
+              So a second person can confirm your reading. Shown to your team only.
+            </p>
           </div>
         </div>
       </div>
@@ -235,7 +275,7 @@ export default function CapturePage() {
                 height: `${GUIDE_BOX.h * 100}%`,
               }}
             >
-              <span>Gauge here</span>
+              <span>Line the gauge up inside the box</span>
             </div>
           </div>
           {camError && <div className="notice warn">{camError}</div>}
@@ -243,11 +283,14 @@ export default function CapturePage() {
             <button className="big" onClick={capture} disabled={!!camError} style={{ flex: 2 }}>
               📷 Capture
             </button>
-            <label className="button secondary" style={{ margin: 0, flex: 1, textAlign: "center" }}>
+            <label className="button secondary big" style={{ flex: 1, margin: 0 }}>
               Choose photo
               <input type="file" accept="image/*" capture="environment" hidden onChange={(e) => pickFile(e.target.files?.[0])} />
             </label>
           </div>
+          <p className="small muted" style={{ margin: "0.6rem 0 0" }}>
+            Make sure the waterline and the nearest painted number are both visible.
+          </p>
         </div>
       )}
 
@@ -255,7 +298,8 @@ export default function CapturePage() {
         <div className="card">
           <div className="grid">
             <div>
-              <img src={photo} alt="Captured gauge" style={{ maxHeight: 420, maxWidth: "100%", borderRadius: 8 }} />
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img src={photo} alt="Captured gauge" className="shot" />
             </div>
             <div>
               {check?.issues.map((i) => (
@@ -274,16 +318,13 @@ export default function CapturePage() {
                 value={level}
                 onChange={(e) => setLevel(e.target.value)}
                 placeholder={station ? `e.g. ${station.thresholds.alert.toFixed(2)}` : "e.g. 15.40"}
+                autoFocus
               />
               {!levelCheck.ok && (
                 <div className="notice error small">
-                  {levelCheck.message}{" "}
+                  <div className="field-error">{levelCheck.message}</div>
                   {levelCheck.suggestion != null && (
-                    <button
-                      className="secondary"
-                      style={{ padding: "0.2rem 0.6rem" }}
-                      onClick={() => setLevel(levelCheck.suggestion!.toFixed(2))}
-                    >
+                    <button className="ghost" onClick={() => setLevel(levelCheck.suggestion!.toFixed(2))}>
                       Did you mean {levelCheck.suggestion.toFixed(2)} m?
                     </button>
                   )}
@@ -292,38 +333,46 @@ export default function CapturePage() {
               <p className="small muted" style={{ marginTop: 4 }}>
                 {aiMode === "live"
                   ? "Your reading is checked against the AI's. If they don't agree, a team member confirms it."
-                  : "Required: the AI reader is off, so your reading is sent to a team member to confirm."}
+                  : "Required: the AI reader is off, so your reading goes to a team member to confirm."}
               </p>
               {sendError && <div className="notice error small">Not sent: {sendError}</div>}
-              {blocked ? (
-                <div className="row" style={{ marginTop: "0.75rem" }}>
-                  <button className="big" onClick={reset} disabled={phase === "sending"} style={{ flex: 2 }}>
-                    📷 Retake photo
-                  </button>
-                  <button
-                    className="secondary"
-                    onClick={send}
-                    disabled={phase === "sending" || !stationId || !levelCheck.ok || levelMissing}
-                    style={{ flex: 1 }}
-                  >
-                    {phase === "sending" ? "Sending…" : "Send anyway"}
-                  </button>
+
+              <div className="sticky-actions">
+                <div className="row">
+                  {blocked ? (
+                    <>
+                      <button className="big" onClick={reset} disabled={phase === "sending"} style={{ flex: 2 }}>
+                        📷 Retake photo
+                      </button>
+                      <button
+                        className="secondary big"
+                        onClick={send}
+                        disabled={phase === "sending" || !canSend}
+                        style={{ flex: 1 }}
+                      >
+                        {phase === "sending" ? "Sending…" : "Send anyway"}
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <button className="big" onClick={send} disabled={phase === "sending" || !canSend} style={{ flex: 2 }}>
+                        {phase === "sending" ? (
+                          <>
+                            <span className="spinner" aria-hidden /> Sending…
+                          </>
+                        ) : levelMissing ? (
+                          "Enter your reading first"
+                        ) : (
+                          "Send reading"
+                        )}
+                      </button>
+                      <button className="secondary big" onClick={reset} disabled={phase === "sending"} style={{ flex: 1 }}>
+                        Retake
+                      </button>
+                    </>
+                  )}
                 </div>
-              ) : (
-                <div className="row" style={{ marginTop: "0.75rem" }}>
-                  <button
-                    className="big"
-                    onClick={send}
-                    disabled={phase === "sending" || !stationId || !levelCheck.ok || levelMissing}
-                    style={{ flex: 2 }}
-                  >
-                    {phase === "sending" ? "Sending…" : levelMissing ? "Enter your reading first" : "Send reading"}
-                  </button>
-                  <button className="secondary" onClick={reset} disabled={phase === "sending"} style={{ flex: 1 }}>
-                    Retake
-                  </button>
-                </div>
-              )}
+              </div>
             </div>
           </div>
         </div>
@@ -346,44 +395,44 @@ export default function CapturePage() {
 
 function ResultSummary({ data, station }: { data: FrameResponse; station?: Station }) {
   const r = data.reading;
-  const stage =
-    r.level != null && station
-      ? r.level >= station.thresholds.critical
-        ? "critical"
-        : r.level >= station.thresholds.alarm
-          ? "alarm"
-          : r.level >= station.thresholds.alert
-            ? "alert"
-            : "normal"
-      : null;
+  const stage = r.level != null && station ? classify(r.level, station.thresholds) : null;
   return (
     <div>
+      <div className="row spread small" style={{ margin: "0.5rem 0" }}>
+        <span>
+          AI read: <strong>{formatLevel(data.ai.level)}</strong>
+          {data.ai.confidence != null && ` (confidence ${data.ai.confidence.toFixed(2)})`}
+          {data.ai.mode === "mock" && <span className="muted"> — mock AI mode</span>}
+        </span>
+        <span>
+          Your reading: <strong>{formatLevel(r.observerLevel)}</strong>
+        </span>
+      </div>
       <p style={{ margin: "0.5rem 0" }}>
-        AI read: <strong>{formatLevel(data.ai.level)}</strong>
-        {data.ai.confidence != null && ` (confidence ${data.ai.confidence.toFixed(2)})`}
-        {data.ai.mode === "mock" && <span className="muted"> — mock AI mode</span>}
-        <br />
-        Your reading: <strong>{formatLevel(r.observerLevel)}</strong>
-      </p>
-      <p style={{ margin: "0.5rem 0" }}>
-        Status: <span className={`pill ${r.status}`}>{r.status.replace("_", " ")}</span> <span className="small">{r.statusReason}</span>
+        <span className={`pill ${r.status}`}>{r.status.replace("_", " ")}</span>{" "}
+        <span className="small muted">{r.statusReason}</span>
       </p>
       {r.status === "needs_confirmation" &&
         (data.teamNotified ? (
           <div className="notice ok small">Sent to {data.teamNotified} team member(s) to confirm.</div>
         ) : (
           <div className="notice warn small">
-            <strong>No observer team is set up to confirm this reading.</strong> Call or message your coordinator with the
-            level now.
+            <strong>No observer team is set up to confirm this reading.</strong> Call or message your coordinator with
+            the level now.
           </div>
         ))}
+      {!!data.provisional?.length && (
+        <div className="notice warn small">
+          Residents were sent a provisional warning while this reading is being confirmed.
+        </div>
+      )}
       {r.status === "rejected" && (
         <div className="notice error small">
           The photo couldn&apos;t be read and no level was entered. Retake the photo or type the level you see.
         </div>
       )}
       {stage && (
-        <div className="notice" style={{ borderColor: LEVELS[stage].color }}>
+        <div className={`notice stage-${stage}`} style={{ borderLeftColor: LEVELS[stage].color }}>
           <strong>{LEVELS[stage].label}</strong> — {LEVELS[stage].action}
         </div>
       )}
