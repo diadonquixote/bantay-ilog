@@ -4,10 +4,15 @@
  * A volunteer at the river often has no signal at all. The capture page and its
  * assets are cached so the app still opens; the reading itself is queued in
  * IndexedDB by the page and sent when the phone is back online. API calls are
- * never cached — a stale river level would be worse than none.
+ * never cached — a stale river level would be worse than none. The capture page
+ * keeps its own copy of the station list for offline use.
+ *
+ * Only true static files are cached; Next.js page-data requests (?_rsc=…) go to
+ * the network so client-side navigation never shows an old river level.
  */
-const CACHE = "bantay-ilog-v1";
+const CACHE = "bantay-ilog-v2";
 const SHELL = ["/", "/capture", "/dashboard", "/manifest.webmanifest", "/icon.svg"];
+const STATIC = /^\/(_next\/static\/|samples\/|audio\/|icon(-maskable)?\.svg$|manifest\.webmanifest$)/;
 
 self.addEventListener("install", (event) => {
   event.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).catch(() => {}));
@@ -33,16 +38,21 @@ self.addEventListener("fetch", (event) => {
     event.respondWith(
       fetch(request)
         .then((res) => {
-          const copy = res.clone();
-          caches.open(CACHE).then((c) => c.put(request, copy)).catch(() => {});
+          if (res.ok) {
+            const copy = res.clone();
+            caches.open(CACHE).then((c) => c.put(request, copy)).catch(() => {});
+          }
           return res;
         })
-        .catch(() => caches.match(request).then((hit) => hit || caches.match("/capture"))),
+        .catch(() =>
+          caches.match(request, { ignoreSearch: true }).then((hit) => hit || caches.match("/capture")),
+        ),
     );
     return;
   }
 
-  // Static assets: cache first.
+  // Static assets: cache first. Everything else (including ?_rsc page data) goes to the network.
+  if (!STATIC.test(url.pathname)) return;
   event.respondWith(
     caches.match(request).then(
       (hit) =>

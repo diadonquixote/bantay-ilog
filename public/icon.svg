@@ -1,12 +1,10 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192" role="img" aria-label="Bantay Ilog">
-  <rect width="192" height="192" rx="40" fill="#1864ab"/>
-  <rect x="78" y="26" width="36" height="120" rx="4" fill="#f8f8f4"/>
-  <g fill="#d62828">
-    <rect x="84" y="38" width="24" height="10"/>
-    <rect x="84" y="58" width="24" height="10"/>
-    <rect x="84" y="78" width="24" height="10"/>
-    <rect x="84" y="98" width="24" height="10"/>
-  </g>
-  <path d="M0 126c24 0 24 12 48 12s24-12 48-12 24 12 48 12 24-12 48-12v66H0z" fill="#4dabf7" opacity="0.95"/>
-  <path d="M0 146c24 0 24 12 48 12s24-12 48-12 24 12 48 12 24-12 48-12v46H0z" fill="#1c7ed6"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="96" fill="#13232e"/>
+  <rect x="176" y="56" width="160" height="400" rx="10" fill="#fbfbf9"/>
+  <rect x="200" y="84" width="30" height="190" fill="#c8102e"/>
+  <rect x="200" y="84" width="100" height="26" fill="#c8102e"/>
+  <rect x="200" y="166" width="100" height="26" fill="#c8102e"/>
+  <rect x="200" y="248" width="100" height="26" fill="#c8102e"/>
+  <path d="M96 318 q40 -26 80 0 t80 0 t80 0 t80 0 V456 H96 Z" fill="#3a9fc0"/>
+  <path d="M96 318 q40 -26 80 0 t80 0 t80 0 t80 0" fill="none" stroke="#bfe6f2" stroke-width="10"/>
 </svg>

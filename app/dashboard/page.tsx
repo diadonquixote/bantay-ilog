@@ -2,17 +2,14 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, useAdminToken } from "@/components/api";
-import { LevelBadge } from "@/components/LevelBadge";
+import { readLocal, useClientValue, writeLocal } from "@/components/hooks";
+import { LevelBadge, stageStyle } from "@/components/LevelBadge";
 import { LevelChart } from "@/components/LevelChart";
-import { formatLevel, LEVELS } from "@/lib/levels";
+import { StationStatusPanel, DEFAULT_STALE_MIN, type PanelPending, type PanelTrend } from "@/components/StationStatusPanel";
+import { TeamPhoto } from "@/components/TeamPhoto";
+import { formatManila, TimeAgo } from "@/components/TimeAgo";
+import { formatLevel } from "@/lib/levels";
 import type { Advisory, Alert, LevelKey, OutboxMessage, Reading, Station } from "@/lib/schemas";
-
-interface Trend {
-  ratePerHour: number | null;
-  direction: string;
-  samples: number;
-  eta: { key: LevelKey; value: number; minutes: number } | null;
-}
 
 interface DashboardData {
   station: Station;
@@ -23,17 +20,20 @@ interface DashboardData {
     db: string;
     telegram: string;
     adminTokenRequired: boolean;
+    /** Admin actions unprotected (dev only). */
     adminOpen: boolean;
+    /** This browser sent a valid admin token (or the app is open). */
     isAdmin: boolean;
+    /** Last run of the reminders/PAGASA job. */
     lastTick: string | null;
   };
   status: {
     latest: Reading | null;
     stage: LevelKey | null;
     ageMinutes: number | null;
-    trend: Trend;
+    trend: PanelTrend & { samples: number };
     pendingConfirmations: number;
-    pendingHighest: { readingId: string; level: number; stage: LevelKey; takenAt: string } | null;
+    pendingHighest: (PanelPending & { readingId: string }) | null;
   };
   readings: Reading[];
   alerts: Alert[];
@@ -42,68 +42,69 @@ interface DashboardData {
   outbox: OutboxMessage[] | null;
 }
 
-const fmt = (iso: string) =>
-  new Intl.DateTimeFormat("en-PH", {
-    timeZone: "Asia/Manila",
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  }).format(new Date(iso));
+const RANGES = [
+  { hours: 6, label: "6 h" },
+  { hours: 24, label: "24 h" },
+  { hours: 72, label: "3 days" },
+  { hours: 168, label: "7 days" },
+];
 
-const ago = (min: number | null) =>
-  min == null ? "" : min < 1 ? "just now" : min < 60 ? `${min} min ago` : `${Math.round(min / 60)} h ago`;
-
-const STALE_MIN = 90;
-
-function initialStation(): string | null {
-  if (typeof window === "undefined") return null;
-  return new URLSearchParams(window.location.search).get("station");
-}
+const WARNING_LABEL: Record<string, string> = {
+  red: "RED rainfall warning",
+  orange: "ORANGE rainfall warning",
+  yellow: "YELLOW rainfall warning",
+  none: "No rainfall warning",
+  unknown: "Rainfall warning unknown",
+};
 
 export default function Dashboard() {
-  const [stationId, setStationId] = useState<string | null>(null);
+  // Station from the link (?station=…) until one is picked; nothing is fetched until hydrated.
+  const urlStation = useClientValue(() => new URLSearchParams(window.location.search).get("station"), null);
+  const hydrated = useClientValue(() => true, false);
+  const [picked, setStationId] = useState<string | null>(null);
+  const stationId = picked ?? urlStation;
   const [hours, setHours] = useState(24);
   const [data, setData] = useState<DashboardData | null>(null);
+  const [loadedAt, setLoadedAt] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
-  const [name, setName] = useState("");
+  const savedName = useClientValue(() => readLocal("bantay-name"), "");
+  const [nameEdit, setName] = useState<string | null>(null);
+  const name = nameEdit ?? savedName;
   const [token, setToken] = useAdminToken();
   const [sound, setSound] = useState(false);
-  const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
   const audio = useRef<HTMLAudioElement | null>(null);
 
-  useEffect(() => {
-    setStationId(initialStation());
-    try {
-      setName(localStorage.getItem("bantay-name") ?? "");
-    } catch {}
-  }, []);
-
   const load = useCallback(async () => {
+    if (!hydrated) return;
     try {
-      const qs = stationId ? `?stationId=${encodeURIComponent(stationId)}&hours=${hours}` : `?hours=${hours}`;
-      const first = await api<DashboardData & { stations: Station[] }>(`/api/readings${qs}`);
-      // No station in the URL: land on the first real station.
       if (!stationId) {
-        const pick = first.stations.find((s) => s.id !== "demo") ?? first.stations[0];
-        if (pick) {
-          setStationId(pick.id);
-          return;
-        }
+        // No station in the link: open the first real station.
+        const list = await api<{ stations: Station[] }>("/api/readings");
+        const pick = list.stations.find((s) => s.id !== "demo") ?? list.stations[0];
+        if (pick) setStationId(pick.id);
+        else setError("No gauge stations are set up yet.");
+        return;
       }
-      setData(first);
-      setUpdatedAt(new Date());
+      setData(await api<DashboardData>(`/api/readings?stationId=${encodeURIComponent(stationId)}&hours=${hours}`));
+      setLoadedAt(new Date().toISOString());
       setError(null);
     } catch (e) {
       setError((e as Error).message);
     }
-  }, [stationId, hours, token]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [hydrated, stationId, hours, token]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Refresh every 20 s while the page is on screen; a hidden tab costs no data or battery.
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- load() only sets state after awaiting the network
     load();
-    const t = setInterval(load, 20_000);
-    return () => clearInterval(t);
+    const t = setInterval(() => document.visibilityState === "visible" && load(), 20_000);
+    const onShow = () => document.visibilityState === "visible" && load();
+    document.addEventListener("visibilitychange", onShow);
+    return () => {
+      clearInterval(t);
+      document.removeEventListener("visibilitychange", onShow);
+    };
   }, [load]);
 
   const stage = data?.status.stage ?? null;
@@ -113,12 +114,14 @@ export default function Dashboard() {
 
   const selectStation = (id: string) => {
     setStationId(id);
+    setData(null);
     window.history.replaceState(null, "", `?station=${id}`);
   };
 
   const confirm = async (r: Reading, action: "accept" | "reject", level?: number) => {
     if (!name.trim()) {
-      setError("Enter your name before confirming readings.");
+      setError("Type your name first — it is recorded with the confirmation.");
+      document.getElementById("confirmer-name")?.focus();
       return;
     }
     setBusy(r.id);
@@ -134,97 +137,92 @@ export default function Dashboard() {
 
   if (!data) {
     return (
-      <div className="card">
+      <div aria-busy="true">
         {error ? (
-          <>
-            <div className="notice error">{error}</div>
+          <div className="card">
+            <div className="notice error" role="alert">
+              {error}
+            </div>
             <button className="secondary" onClick={load}>
               Try again
             </button>
-          </>
+          </div>
         ) : (
-          <p className="muted">
-            <span className="spinner" aria-hidden /> Loading…
-          </p>
+          <div className="card">
+            <div className="skeleton" style={{ width: "40%" }} />
+            <div className="skeleton" style={{ width: "30%", minHeight: "3.5rem", marginTop: "0.8rem" }} />
+            <div className="skeleton" style={{ width: "60%", marginTop: "0.8rem" }} />
+          </div>
         )}
       </div>
     );
   }
 
   const { station, status, system } = data;
-  const trend = status.trend;
   const pending = data.readings.filter((r) => r.status === "needs_confirmation");
-  const ph = status.pendingHighest;
-  const unconfirmedHigh =
-    ph && ph.stage !== "normal" && (!status.latest || Date.parse(ph.takenAt) > Date.parse(status.latest.takenAt)) ? ph : null;
-  const stale = status.ageMinutes != null && status.ageMinutes > STALE_MIN;
   const needsToken = system.adminTokenRequired && !system.isAdmin;
+  const stale = status.ageMinutes != null && status.ageMinutes > DEFAULT_STALE_MIN;
 
   return (
     <>
-      <audio ref={audio} src="/audio/alarm.wav" preload="auto" />
+      <audio ref={audio} src="/audio/alarm.wav" preload="none" />
 
-      <div className="row spread" style={{ marginBottom: "0.75rem" }}>
+      <div className="page-head" style={{ alignItems: "center" }}>
         <div className="row">
-          <select value={station.id} onChange={(e) => selectStation(e.target.value)} style={{ width: "auto" }} aria-label="Station">
+          <label htmlFor="station-pick" className="eyebrow" style={{ margin: 0 }}>
+            Station
+          </label>
+          <select id="station-pick" value={station.id} onChange={(e) => selectStation(e.target.value)} style={{ width: "auto" }}>
             {data.stations.map((s) => (
               <option key={s.id} value={s.id}>
                 {s.name} — {s.river}
               </option>
             ))}
           </select>
-          <select value={hours} onChange={(e) => setHours(Number(e.target.value))} style={{ width: "auto" }} aria-label="Time range">
-            {[6, 24, 72, 168].map((h) => (
-              <option key={h} value={h}>
-                Last {h < 48 ? `${h} h` : `${h / 24} days`}
-              </option>
-            ))}
-          </select>
         </div>
-        <label className="row small" style={{ margin: 0, fontWeight: 600 }}>
-          <input type="checkbox" checked={sound} onChange={(e) => setSound(e.target.checked)} style={{ width: "auto" }} />
-          Sound alarm at critical
-        </label>
+        <div className="row">
+          <div className="segmented" role="group" aria-label="Time range">
+            {RANGES.map((r) => (
+              <button key={r.hours} aria-pressed={hours === r.hours} onClick={() => setHours(r.hours)}>
+                {r.label}
+              </button>
+            ))}
+          </div>
+          <label className="switch">
+            <input type="checkbox" checked={sound} onChange={(e) => setSound(e.target.checked)} />
+            Siren at 3rd alarm
+          </label>
+        </div>
       </div>
 
-      {error && <div className="notice error">{error}</div>}
-
+      {error && (
+        <div className="notice error" role="alert">
+          {error}
+        </div>
+      )}
       {needsToken && (
-        <div className="card">
-          <h2>Team sign-in</h2>
-          <p className="small muted" style={{ marginTop: 0 }}>
-            Volunteer names and gauge photos are only shown to the observer team, and confirming a reading needs the
+        <section className="card" aria-labelledby="signin-h">
+          <h2 id="signin-h">Team sign-in</h2>
+          <p className="hint" style={{ marginTop: 0 }}>
+            Volunteer names and gauge photos are shown only to the observer team, and confirming a reading needs the
             token too.
           </p>
-          <label htmlFor="token">Admin token</label>
-          <input
-            id="token"
-            type="password"
-            value={token}
-            onChange={(e) => setToken(e.target.value)}
-            placeholder="ADMIN_TOKEN"
-            autoComplete="current-password"
-          />
-          <button style={{ marginTop: "0.6rem" }} onClick={load}>
-            Unlock
-          </button>
-        </div>
-      )}
-
-      {unconfirmedHigh && (
-        <div className="notice error loud">
-          <strong>
-            Unconfirmed reading of {formatLevel(unconfirmedHigh.level)} ({LEVELS[unconfirmedHigh.stage].label}) since{" "}
-            {fmt(unconfirmedHigh.takenAt)}.
-          </strong>{" "}
-          Residents get the confirmed alert once a team member confirms it below.
-        </div>
-      )}
-      {stale && (
-        <div className="notice warn">
-          <strong>No fresh reading for {ago(status.ageMinutes)}.</strong> The alert agent will not warn residents from a
-          stale number — ask the team for a new photo.
-        </div>
+          <div className="row" style={{ maxWidth: 480 }}>
+            <label htmlFor="token" className="sr-only">
+              Admin token
+            </label>
+            <input
+              id="token"
+              type="password"
+              value={token}
+              onChange={(e) => setToken(e.target.value)}
+              placeholder="Admin token"
+              autoComplete="current-password"
+              style={{ flex: 1 }}
+            />
+            <button onClick={load}>Unlock</button>
+          </div>
+        </section>
       )}
       {system.adminOpen && (
         <div className="notice warn small">
@@ -232,199 +230,207 @@ export default function Dashboard() {
           putting the app on the internet.
         </div>
       )}
-      {station.teamChatIds.length === 0 && system.isAdmin && (
+      {system.isAdmin && station.teamChatIds.length === 0 && (
         <div className="notice warn">
-          No observer team is set up for this station, so nobody is notified when a reading needs confirmation.{" "}
-          <a href="/setup">Add team chat IDs in Setup.</a>
+          <strong>No observer team for this station.</strong> Nobody is notified when a reading needs confirmation.{" "}
+          <a href="/setup">Add team members in Setup</a>.
+        </div>
+      )}
+
+      <StationStatusPanel
+        station={station}
+        latest={status.latest}
+        stage={status.stage}
+        trend={status.trend}
+        pending={status.pendingHighest}
+        ageMinutes={status.ageMinutes}
+        headingLevel={1}
+      >
+        <div className="status-meta" style={{ marginTop: "0.4rem" }}>
+          <span>
+            PAGASA: <strong>{data.advisory ? WARNING_LABEL[data.advisory.warning] : "no advisory on record"}</strong>
+          </span>
+          <span>
+            <strong>{data.subscriberCount}</strong> resident{data.subscriberCount === 1 ? "" : "s"} subscribed
+            {system.isAdmin && (
+              <>
+                {" "}
+                · <strong>{station.teamChatIds.length}</strong> on the observer team
+              </>
+            )}
+          </span>
+          <span>
+            Background job:{" "}
+            {system.lastTick ? (
+              <>
+                last ran <TimeAgo iso={system.lastTick} />
+              </>
+            ) : (
+              "has not run yet"
+            )}
+          </span>
+          {loadedAt && (
+            <span>
+              Live · refreshed <TimeAgo iso={loadedAt} />
+            </span>
+          )}
+        </div>
+      </StationStatusPanel>
+
+      {stale && (
+        <div className="notice warn">
+          The alert agent will not warn residents from a stale number — <strong>ask the team for a new photo</strong>.
         </div>
       )}
 
       {pending.length > 0 && (
-        <section className="card" style={{ borderColor: "var(--alarm)" }}>
-          <h2>Waiting for confirmation ({pending.length})</h2>
-          <p className="small muted" style={{ marginTop: 0 }}>
-            A reading is confirmed by someone other than the person who sent it.
+        <section className="card" style={{ borderColor: "var(--stage-alarm)", borderWidth: 2 }} aria-labelledby="pending-h">
+          <h2 id="pending-h">
+            Waiting for confirmation <span className="pill needs_confirmation">{pending.length}</span>
+          </h2>
+          <p className="hint" style={{ marginTop: 0 }}>
+            Residents are alerted only after a reading is confirmed. You can&apos;t confirm a reading you sent yourself.
           </p>
-          <label htmlFor="who">Your name</label>
-          <input
-            id="who"
-            placeholder="Required to confirm"
-            value={name}
-            onChange={(e) => {
-              setName(e.target.value);
-              try {
-                localStorage.setItem("bantay-name", e.target.value);
-              } catch {}
-            }}
-            style={{ maxWidth: 320 }}
-          />
+          <div className="fields" style={{ maxWidth: 560 }}>
+            <div>
+              <label htmlFor="confirmer-name">Your name</label>
+              <input
+                id="confirmer-name"
+                value={name}
+                autoComplete="name"
+                onChange={(e) => {
+                  setName(e.target.value);
+                  writeLocal("bantay-name", e.target.value);
+                }}
+              />
+            </div>
+            {data.system.adminTokenRequired && (
+              <div>
+                <label htmlFor="confirm-token">Admin token</label>
+                <input id="confirm-token" type="password" value={token} onChange={(e) => setToken(e.target.value)} />
+              </div>
+            )}
+          </div>
           {pending.map((r) => (
             <PendingReading key={r.id} r={r} busy={busy === r.id} onConfirm={confirm} canSeePhoto={system.isAdmin} />
           ))}
         </section>
       )}
 
-      <div className="grid">
-        <section className={`card hero stage-${stage ?? "none"}`}>
-          <div className="muted small">
-            {station.name} · {station.river}
-          </div>
-          <div className="big-number">
-            {status.latest ? (
-              formatLevel(status.latest.level)
-            ) : (
-              <span className="muted" style={{ fontSize: "1.4rem", fontWeight: 600 }}>No reading yet</span>
-            )}
-          </div>
-          {stage && (
-            <div className="row">
-              <LevelBadge stage={stage} /> <LevelBadge stage={stage} tl />
-            </div>
-          )}
-          {stage && <p style={{ margin: "0.6rem 0 0" }}>{LEVELS[stage].action}</p>}
-          <p className="small muted" style={{ margin: "0.35rem 0 0" }}>
-            {status.latest
-              ? `Confirmed ${fmt(status.latest.takenAt)} · ${ago(status.ageMinutes)}`
-              : "Waiting for the first confirmed reading."}
-          </p>
-        </section>
-
-        <section className="card">
-          <h2>Trend</h2>
-          {trend.ratePerHour == null ? (
-            <p className="muted">Need at least two confirmed readings in the last 2 hours.</p>
-          ) : (
-            <>
-              <div className="big-number" style={{ fontSize: "1.9rem" }}>
-                {trend.direction === "rising" ? "▲" : trend.direction === "falling" ? "▼" : "▬"}{" "}
-                {trend.ratePerHour >= 0 ? "+" : ""}
-                {trend.ratePerHour.toFixed(2)} m/h
-              </div>
-              <p className="small muted" style={{ margin: 0 }}>
-                {trend.direction} over {trend.samples} readings (last 2 h)
-              </p>
-              {trend.eta && (
-                <div className="notice warn small">
-                  Projected to reach <strong>{LEVELS[trend.eta.key].label}</strong> ({trend.eta.value} m) in about{" "}
-                  <strong>{trend.eta.minutes} min</strong> if the current rate holds.
-                </div>
-              )}
-            </>
-          )}
-        </section>
-
-        <section className="card">
-          <h2>PAGASA &amp; reach</h2>
-          <p className="small" style={{ margin: 0 }}>
-            Rainfall warning: <strong>{data.advisory ? data.advisory.warning.toUpperCase() : "none on record"}</strong>
-            {data.advisory && <span className="muted"> · {fmt(data.advisory.fetchedAt)}</span>}
-          </p>
-          <p className="small" style={{ margin: "0.3rem 0 0" }}>
-            Subscribers: <strong>{data.subscriberCount}</strong> · Observer team:{" "}
-            <strong>{system.isAdmin ? station.teamChatIds.length : "—"}</strong>
-          </p>
-          <p className="small muted" style={{ margin: "0.3rem 0 0" }}>
-            Background job: {system.lastTick ? `last ran ${fmt(system.lastTick)}` : "has not run yet"}
-          </p>
-          {updatedAt && (
-            <p className="small muted" style={{ margin: "0.3rem 0 0" }}>
-              Page refreshes every 20 s · updated {updatedAt.toLocaleTimeString("en-PH", { timeZone: "Asia/Manila" })}
-            </p>
-          )}
-        </section>
-      </div>
-
-      <section className="card">
-        <h2>Water level</h2>
+      <section className="card" aria-labelledby="chart-h">
+        <h2 id="chart-h">Water level, last {RANGES.find((r) => r.hours === hours)?.label}</h2>
         <LevelChart station={station} readings={data.readings} hours={hours} />
       </section>
 
-      <section className="card">
-        <h2>Alerts sent</h2>
+      <section className="card below-fold" aria-labelledby="alerts-h">
+        <h2 id="alerts-h">Alerts sent to residents</h2>
         {data.alerts.length === 0 ? (
           <p className="muted">No alerts in this period.</p>
         ) : (
           data.alerts.map((a) => (
-            <div key={a.id} className={`notice stage-${a.level}`} style={{ borderLeftColor: LEVELS[a.level].color }}>
+            <article key={a.id} className="alert-item" style={stageStyle(a.level)}>
               <div className="row small muted">
-                <LevelBadge stage={a.level} /> <span className="pill">{a.kind}</span> {fmt(a.createdAt)} ·{" "}
-                {a.origin === "agent" ? "agent decided" : "rule"} · {a.recipients} recipient(s)
+                <LevelBadge stage={a.level} />
+                <span className="pill">{a.kind}</span>
+                <span className="data">{formatManila(a.createdAt)}</span>
+                <span>
+                  {a.origin === "agent" ? "the alert agent chose to send it" : "sent by rule"} · reached {a.recipients} chat
+                  {a.recipients === 1 ? "" : "s"}
+                </span>
               </div>
-              <div style={{ whiteSpace: "pre-wrap", marginTop: "0.35rem" }}>{a.message}</div>
-            </div>
+              <div className="msg">{a.message}</div>
+            </article>
           ))
         )}
       </section>
 
-      <section className="card">
-        <h2>Readings</h2>
-        <div className="table-wrap">
-          <table className="stack-on-phone">
-            <thead>
-              <tr>
-                <th>Time</th>
-                <th>Level</th>
-                <th>AI</th>
-                <th>Observer</th>
-                <th>Status</th>
-                {system.isAdmin && <th>Photo</th>}
-              </tr>
-            </thead>
-            <tbody>
-              {data.readings.map((r) => (
-                <tr key={r.id}>
-                  <td className="num" data-label="Time">
-                    {fmt(r.takenAt)}
-                  </td>
-                  <td className="num" data-label="Level">
-                    <strong>{formatLevel(r.level)}</strong>
-                  </td>
-                  <td className="num" data-label="AI">
-                    {formatLevel(r.aiLevel)}
-                    {r.aiConfidence != null && <span className="muted small"> ({r.aiConfidence.toFixed(2)})</span>}
-                  </td>
-                  <td className="num" data-label="Observer">
-                    {formatLevel(r.observerLevel)}
-                    {r.observerName && <div className="muted small">{r.observerName}</div>}
-                  </td>
-                  <td data-label="Status">
-                    <span className={`pill ${r.status}`}>{r.status.replace("_", " ")}</span>
-                    <div className="muted small">{r.statusReason}</div>
-                  </td>
-                  {system.isAdmin && (
-                    <td data-label="Photo">
-                      {r.photoPath ? (
-                        <a href={`/api/frame?readingId=${r.id}`} target="_blank" rel="noreferrer">
-                          view
-                        </a>
-                      ) : (
-                        "—"
-                      )}
-                    </td>
-                  )}
+      <section className="card below-fold" aria-labelledby="readings-h">
+        <h2 id="readings-h">All readings</h2>
+        {data.readings.length === 0 ? (
+          <p className="muted">No readings in this period.</p>
+        ) : (
+          <div className="table-wrap">
+            <table className="stack-on-phone">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Level</th>
+                  <th>AI read</th>
+                  <th>Observer</th>
+                  <th>Status</th>
+                  {system.isAdmin && <th>Photo</th>}
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+              </thead>
+              <tbody>
+                {data.readings.map((r) => (
+                  <tr key={r.id}>
+                    <td className="num" data-label="Time">
+                      {formatManila(r.takenAt)}
+                    </td>
+                    <td className="num" data-label="Level">
+                      <strong>{formatLevel(r.level)}</strong>
+                    </td>
+                    <td className="num" data-label="AI read">
+                      {formatLevel(r.aiLevel)}
+                      {r.aiConfidence != null && <span className="muted"> ({Math.round(r.aiConfidence * 100)}%)</span>}
+                    </td>
+                    <td className="num" data-label="Observer">
+                      {formatLevel(r.observerLevel)}
+                      {r.observerName && <div className="muted">{r.observerName}</div>}
+                    </td>
+                    <td data-label="Status">
+                      <span className={`pill ${r.status}`}>{r.status.replace("_", " ")}</span>
+                      <div className="muted small">{r.statusReason}</div>
+                    </td>
+                    {system.isAdmin && (
+                      <td data-label="Photo">
+                        {r.photoPath ? <PhotoCell readingId={r.id} takenAt={r.takenAt} /> : <span className="muted">—</span>}
+                      </td>
+                    )}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </section>
 
       {data.outbox && (
-        <section className="card">
-          <h2>Message outbox</h2>
-          <p className="small muted">
-            Recent Telegram messages{data.system.telegram === "log" ? " (not delivered: no bot token configured)" : ""}.
+        <details className="card more">
+          <summary>Message log ({data.outbox.length})</summary>
+          <p className="hint">
+            Recent Telegram messages
+            {data.system.telegram === "log" ? " — not delivered, because no bot token is configured." : "."}
           </p>
           <pre className="log">
             {data.outbox.length === 0
               ? "No messages yet."
               : data.outbox
-                  .map((m) => `[${fmt(m.createdAt)} → ${m.chatId}${m.error ? ` ✖ ${m.error}` : ""}]\n${m.text}`)
+                  .map((m) => `[${formatManila(m.createdAt)} → ${m.chatId}${m.error ? ` ✖ ${m.error}` : ""}]\n${m.text}`)
                   .join("\n\n")}
           </pre>
-        </section>
+        </details>
       )}
     </>
+  );
+}
+
+/** Photos load only when asked for: each one is a team-only, token-checked download. */
+function PhotoCell({ readingId, takenAt }: { readingId: string; takenAt: string }) {
+  const [open, setOpen] = useState(false);
+  if (!open) {
+    return (
+      <button className="ghost" style={{ minHeight: 32, padding: "0 0.3rem" }} onClick={() => setOpen(true)}>
+        Show photo
+      </button>
+    );
+  }
+  return (
+    <TeamPhoto
+      readingId={readingId}
+      alt={`Gauge photo sent ${formatManila(takenAt)}`}
+      style={{ width: 90, maxHeight: 150, objectFit: "cover", borderRadius: 6, display: "block" }}
+    />
   );
 }
 
@@ -440,54 +446,59 @@ function PendingReading({
   canSeePhoto: boolean;
 }) {
   const [custom, setCustom] = useState("");
-  const photo = canSeePhoto && r.photoPath ? `/api/frame?readingId=${r.id}` : null;
+  const showPhoto = canSeePhoto && !!r.photoPath;
   return (
-    <div className="notice warn">
-      <div className="row spread">
-        <strong>{fmt(r.takenAt)}</strong>
-        {photo && (
-          <a href={photo} target="_blank" rel="noreferrer" className="small">
-            open photo
-          </a>
-        )}
-      </div>
-      <div className="small">
-        AI: {formatLevel(r.aiLevel)} · Observer: {formatLevel(r.observerLevel)}
-        {r.observerName ? ` (${r.observerName})` : ""}
-      </div>
-      <div className="small muted">{r.statusReason}</div>
-      {photo && (
-        // eslint-disable-next-line @next/next/no-img-element
-        <img src={photo} alt="Gauge photo" style={{ maxHeight: 240, marginTop: 8, borderRadius: 8 }} />
-      )}
-      <div className="row" style={{ marginTop: "0.6rem" }}>
-        {r.aiLevel != null && (
-          <button disabled={busy} onClick={() => onConfirm(r, "accept", r.aiLevel!)}>
-            Accept {r.aiLevel.toFixed(2)} m (AI)
-          </button>
-        )}
-        {r.observerLevel != null && r.observerLevel !== r.aiLevel && (
-          <button disabled={busy} onClick={() => onConfirm(r, "accept", r.observerLevel!)}>
-            Accept {r.observerLevel.toFixed(2)} m (observer)
-          </button>
-        )}
-        <input
-          type="number"
-          step="0.01"
-          inputMode="decimal"
-          placeholder="Other level (m)"
-          value={custom}
-          onChange={(e) => setCustom(e.target.value)}
-          style={{ width: 150 }}
-          aria-label="Other level in metres"
+    <article className="notice warn" style={{ display: "grid", gridTemplateColumns: showPhoto ? "auto 1fr" : "1fr", gap: "1rem" }}>
+      {showPhoto && (
+        <TeamPhoto
+          readingId={r.id}
+          alt={`Gauge photo sent ${formatManila(r.takenAt)}`}
+          style={{ width: 110, maxHeight: 190, objectFit: "cover", borderRadius: 8, display: "block" }}
         />
-        <button className="secondary" disabled={busy || custom === ""} onClick={() => onConfirm(r, "accept", Number(custom))}>
-          Accept typed level
-        </button>
-        <button className="danger" disabled={busy} onClick={() => onConfirm(r, "reject")}>
-          Reject
-        </button>
+      )}
+      <div>
+        <div className="row" style={{ justifyContent: "space-between" }}>
+          <strong className="data">{formatManila(r.takenAt)}</strong>
+          <span className="small muted">
+            <TimeAgo iso={r.takenAt} />
+          </span>
+        </div>
+        <div style={{ margin: "0.3rem 0" }}>
+          AI read <strong className="data">{formatLevel(r.aiLevel)}</strong> · {r.observerName ?? "Observer"} saw{" "}
+          <strong className="data">{formatLevel(r.observerLevel)}</strong>
+        </div>
+        <div className="small muted">{r.statusReason}</div>
+        <div className="row" style={{ marginTop: "0.6rem" }}>
+          {r.aiLevel != null && (
+            <button disabled={busy} onClick={() => onConfirm(r, "accept", r.aiLevel!)}>
+              Accept {r.aiLevel.toFixed(2)} m
+            </button>
+          )}
+          {r.observerLevel != null && r.observerLevel !== r.aiLevel && (
+            <button disabled={busy} onClick={() => onConfirm(r, "accept", r.observerLevel!)}>
+              Accept {r.observerLevel.toFixed(2)} m
+            </button>
+          )}
+          <button className="danger" disabled={busy} onClick={() => onConfirm(r, "reject")}>
+            Reject
+          </button>
+        </div>
+        <div className="row" style={{ marginTop: "0.5rem" }}>
+          <input
+            type="number"
+            inputMode="decimal"
+            step="0.01"
+            aria-label="A different level in metres"
+            placeholder="Other level (m)"
+            value={custom}
+            onChange={(e) => setCustom(e.target.value)}
+            style={{ width: 170 }}
+          />
+          <button className="secondary" disabled={busy || custom === ""} onClick={() => onConfirm(r, "accept", Number(custom))}>
+            Accept this level
+          </button>
+        </div>
       </div>
-    </div>
+    </article>
   );
 }

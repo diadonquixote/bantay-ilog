@@ -30,11 +30,26 @@ export function cropCanvas(src: HTMLCanvasElement, box: CropBox = GUIDE_BOX, max
 
 /** JPEG data URL, stepping quality down until it fits `maxBytes` (base64 length is ~4/3 of bytes). */
 export function toJpegDataUrl(canvas: HTMLCanvasElement, maxBytes = 900_000): string {
-  let q = 0.88;
-  let url = canvas.toDataURL("image/jpeg", q);
+  return encode(canvas, "image/jpeg", 0.88, maxBytes);
+}
+
+/**
+ * The photo to upload. WebP keeps the same visible detail as JPEG in roughly
+ * a quarter to a third fewer bytes, which matters on a weak signal by the river.
+ * Browsers that can't encode WebP (canvas falls back to PNG) get JPEG.
+ */
+export function toUploadDataUrl(canvas: HTMLCanvasElement, maxBytes = 900_000): string {
+  const webp = canvas.toDataURL("image/webp", 0.86);
+  if (webp.startsWith("data:image/webp")) return encode(canvas, "image/webp", 0.86, maxBytes, webp);
+  return toJpegDataUrl(canvas, maxBytes);
+}
+
+function encode(canvas: HTMLCanvasElement, type: string, quality: number, maxBytes: number, first?: string): string {
+  let q = quality;
+  let url = first ?? canvas.toDataURL(type, q);
   while (url.length * 0.75 > maxBytes && q > 0.4) {
     q -= 0.1;
-    url = canvas.toDataURL("image/jpeg", q);
+    url = canvas.toDataURL(type, q);
   }
   return url;
 }

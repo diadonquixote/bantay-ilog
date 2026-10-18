@@ -48,7 +48,7 @@ export async function POST(req: Request) {
   const bytes = Buffer.from(image.base64, "base64");
   if (bytes.length > 5_000_000) return badRequest("Image is larger than 5 MB; crop or compress it first.");
 
-  const ext = image.mediaType === "image/png" ? "png" : "jpg";
+  const ext = image.mediaType === "image/png" ? "png" : image.mediaType === "image/webp" ? "webp" : "jpg";
   const key = `${station.id}/${new Date().toISOString().slice(0, 10)}/${newId()}.${ext}`;
   const photoPath = await db.savePhoto(key, bytes, image.mediaType);
 

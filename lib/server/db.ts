@@ -338,7 +338,8 @@ export class FileDb implements Db {
     if (!file.startsWith(root + path.sep)) return null;
     try {
       const bytes = await fs.readFile(file);
-      return { bytes, contentType: photoPath.endsWith(".png") ? "image/png" : "image/jpeg" };
+      const contentType = photoPath.endsWith(".png") ? "image/png" : photoPath.endsWith(".webp") ? "image/webp" : "image/jpeg";
+      return { bytes, contentType };
     } catch {
       return null;
     }

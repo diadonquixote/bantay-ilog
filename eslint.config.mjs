@@ -1,12 +1,12 @@
-import { dirname } from "node:path";
-import { fileURLToPath } from "node:url";
-import { FlatCompat } from "@eslint/eslintrc";
+// eslint-config-next 16 ships flat configs; load them directly (the FlatCompat
+// wrapper loops on them and crashes ESLint).
+import nextVitals from "eslint-config-next/core-web-vitals";
+import nextTs from "eslint-config-next/typescript";
 
-const compat = new FlatCompat({ baseDirectory: dirname(fileURLToPath(import.meta.url)) });
-
-export default [
+const config = [
   { ignores: [".next/**", "node_modules/**", "public/**", "next-env.d.ts"] },
-  ...compat.extends("next/core-web-vitals", "next/typescript"),
+  ...nextVitals,
+  ...nextTs,
   {
     rules: {
       "@typescript-eslint/no-explicit-any": "off",
@@ -14,3 +14,5 @@ export default [
     },
   },
 ];
+
+export default config;

@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { useNow } from "./hooks";
 import { LEVELS } from "@/lib/levels";
 import type { Reading, Station } from "@/lib/schemas";
 
@@ -23,7 +24,8 @@ export function LevelChart({ station, readings, hours }: { station: Station; rea
     return () => ro.disconnect();
   }, []);
   const H = W < 500 ? 240 : 300;
-  const now = Date.now();
+  // The chart is only drawn in the browser, after data has loaded, so the clock is always set.
+  const now = useNow(60_000) ?? 0;
   const accepted = readings
     .filter((r) => r.status === "accepted" && r.level != null)
     .map((r) => ({ t: Date.parse(r.takenAt), v: r.level! }))
@@ -75,13 +77,13 @@ export function LevelChart({ station, readings, hours }: { station: Station; rea
           />
         ))}
         {[
-          { v: th.alert, c: LEVELS.alert.color, l: "Alert" },
-          { v: th.alarm, c: LEVELS.alarm.color, l: "Alarm" },
-          { v: th.critical, c: LEVELS.critical.color, l: "Critical" },
+          { v: th.alert, c: LEVELS.alert.color, ink: "var(--stage-alert-ink)", l: "1st alarm" },
+          { v: th.alarm, c: LEVELS.alarm.color, ink: "var(--stage-alarm-ink)", l: "2nd alarm" },
+          { v: th.critical, c: LEVELS.critical.color, ink: "var(--stage-critical-ink)", l: "3rd alarm" },
         ].map((t) => (
           <g key={t.l}>
             <line x1={PAD.l} x2={W - PAD.r} y1={y(t.v)} y2={y(t.v)} stroke={t.c} strokeDasharray="5 4" strokeWidth={1.5} />
-            <text x={PAD.l + 6} y={y(t.v) - 4} textAnchor="start" fontSize={11} fill={t.c} fontWeight={600}>
+            <text x={PAD.l + 6} y={y(t.v) - 4} textAnchor="start" fontSize={12} fill={t.ink} fontWeight={700}>
               {t.l} {t.v} m
             </text>
           </g>
@@ -89,7 +91,7 @@ export function LevelChart({ station, readings, hours }: { station: Station; rea
         {yTicks.map((v) => (
           <g key={v}>
             <line x1={PAD.l} x2={W - PAD.r} y1={y(v)} y2={y(v)} stroke="currentColor" opacity={0.08} />
-            <text x={PAD.l - 6} y={y(v) + 4} textAnchor="end" fontSize={11} fill="currentColor" opacity={0.7}>
+            <text x={PAD.l - 6} y={y(v) + 4} textAnchor="end" fontSize={12} fill="currentColor" opacity={0.75}>
               {v}
             </text>
           </g>
@@ -100,27 +102,27 @@ export function LevelChart({ station, readings, hours }: { station: Station; rea
             x={x(t)}
             y={H - 8}
             textAnchor={t === t0 ? "start" : t === t1 ? "end" : "middle"}
-            fontSize={11}
+            fontSize={12}
             fill="currentColor"
-            opacity={0.7}
+            opacity={0.75}
           >
             {fmtTime(t)}
           </text>
         ))}
-        <path d={path} fill="none" stroke="var(--water)" strokeWidth={2.5} strokeLinejoin="round" />
+        <path d={path} fill="none" stroke="var(--water)" strokeWidth={3} strokeLinejoin="round" strokeLinecap="round" />
         {accepted.map((p) => (
           <circle key={`a${p.t}`} cx={x(p.t)} cy={y(p.v)} r={3.5} fill="var(--water)">
             <title>{`${p.v.toFixed(2)} m at ${fmtTime(p.t)}`}</title>
           </circle>
         ))}
         {pending.map((p) => (
-          <circle key={`p${p.t}`} cx={x(p.t)} cy={y(p.v)} r={5} fill="none" stroke="var(--alarm)" strokeWidth={2}>
+          <circle key={`p${p.t}`} cx={x(p.t)} cy={y(p.v)} r={5} fill="none" stroke="var(--stage-alarm)" strokeWidth={2}>
             <title>{`Unconfirmed ${p.v.toFixed(2)} m at ${fmtTime(p.t)}`}</title>
           </circle>
         ))}
       </svg>
       <p className="small muted" style={{ margin: "0.25rem 0 0" }}>
-        Line: confirmed readings (metres). Hollow orange circles: readings waiting for confirmation.
+        Blue line: confirmed readings in metres. Orange rings: reports still waiting for confirmation.
       </p>
     </div>
   );

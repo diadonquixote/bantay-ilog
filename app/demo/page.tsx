@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useEffect, useState } from "react";
 import { api, useAdminToken } from "@/components/api";
 import { LevelBadge } from "@/components/LevelBadge";
+import { StaffGauge } from "@/components/StaffGauge";
 import { urlToCanvas } from "@/lib/client/camera";
 import { toJpegDataUrl } from "@/lib/client/crop";
 import { DEMO_LEVELS, sampleName } from "@/lib/gaugeSvg";
@@ -112,41 +113,59 @@ export default function DemoPage() {
     }
   };
 
+  const finals = steps
+    .map((s) => s.confirmed?.level ?? s.res?.reading.level ?? null)
+    .filter((v): v is number => v != null);
+  const shownLevel = finals.at(-1) ?? null;
+  const done = steps.filter((s) => s.res || s.error).length;
+
   return (
     <>
-      <h1>Demo: a rising river</h1>
-      <div className="card">
-        <p style={{ marginTop: 0 }}>
-          This sends {DEMO_LEVELS.length} synthetic gauge photos, {STEP_MIN} minutes apart, through the real pipeline for the
-          demo station (alert {DEMO_STATION.thresholds.alert} m, alarm {DEMO_STATION.thresholds.alarm} m, critical{" "}
-          {DEMO_STATION.thresholds.critical} m). At step 7 the observer types a wrong number, so the reading is held for a team
-          member to confirm.
-        </p>
-        <p className="small muted">
-          AI mode: <strong>{aiMode}</strong>
-          {aiMode === "mock"
-            ? " — without an API key the demo uses the true level of each sample (with a small error) as the AI reading."
-            : " — Claude reads each synthetic gauge image for real."}
-        </p>
-        {adminRequired && (
-          <input
-            type="password"
-            placeholder="Admin token"
-            value={token}
-            onChange={(e) => setToken(e.target.value)}
-            style={{ maxWidth: 300, marginBottom: "0.5rem" }}
-          />
-        )}
-        <div className="row">
-          <button onClick={run} disabled={running}>
-            {running ? "Running…" : steps.length ? "Run again" : "Run demo"}
-          </button>
-          <Link className="button secondary" href="/dashboard?station=demo">
-            Open demo dashboard
-          </Link>
+      <div className="page-head">
+        <div>
+          <h1>Demo: a rising river</h1>
+          <p className="muted">Two hours of a flood in a few seconds, through the real system.</p>
         </div>
-        {error && <div className="notice error">{error}</div>}
       </div>
+      <section className="card" style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto", gap: "1rem 1.5rem", alignItems: "start" }}>
+        <div>
+          <p style={{ marginTop: 0 }}>
+            Sends {DEMO_LEVELS.length} gauge photos, {STEP_MIN} minutes apart, for a demo station with alarms at{" "}
+            <strong>{DEMO_STATION.thresholds.alert} m</strong>, <strong>{DEMO_STATION.thresholds.alarm} m</strong> and{" "}
+            <strong>{DEMO_STATION.thresholds.critical} m</strong>. At step 7 the volunteer types a wrong number, so a team
+            leader has to confirm it.
+          </p>
+          <p className="hint">
+            {aiMode === "mock"
+              ? "The AI reader is off, so each photo's true level (with a small error) stands in for the AI reading."
+              : "Claude reads each gauge photo for real."}
+          </p>
+          {adminRequired && (
+            <div style={{ maxWidth: 300 }}>
+              <label htmlFor="demo-token">Admin token</label>
+              <input id="demo-token" type="password" value={token} onChange={(e) => setToken(e.target.value)} />
+            </div>
+          )}
+          <div className="row" style={{ marginTop: "1rem" }}>
+            <button onClick={run} disabled={running}>
+              {running ? "Running…" : steps.length ? "Run again" : "Run demo"}
+            </button>
+            <Link className="button secondary" href="/dashboard?station=demo">
+              Open demo dashboard
+            </Link>
+          </div>
+          {(running || steps.length > 0) && (
+            <div style={{ marginTop: "1rem" }}>
+              <progress max={DEMO_LEVELS.length} value={done} style={{ width: "100%", accentColor: "var(--accent)" }} aria-label="Demo progress" />
+              <p className="hint" role="status">
+                {done} of {DEMO_LEVELS.length} readings processed
+              </p>
+            </div>
+          )}
+          {error && <div className="notice error">{error}</div>}
+        </div>
+        <StaffGauge station={DEMO_STATION} level={shownLevel} height={240} />
+      </section>
 
       {steps.map((s) => {
         const r = s.res?.reading;
@@ -155,7 +174,6 @@ export default function DemoPage() {
         return (
           <div key={s.i} className="card">
             <div className="row" style={{ alignItems: "flex-start", gap: "1rem", flexWrap: "nowrap" }}>
-              {/* eslint-disable-next-line @next/next/no-img-element */}
               <img src={s.image} alt={`Synthetic gauge at ${s.trueLevel} m`} style={{ width: 90, borderRadius: 6, flexShrink: 0 }} />
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div className="row" style={{ justifyContent: "space-between" }}>
